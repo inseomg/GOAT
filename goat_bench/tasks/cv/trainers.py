@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+from goat_bench.utils.helpers import exit_requested
 from .utils import percentile
 
 
@@ -94,6 +95,8 @@ class TrainerBase:
                 loss=f"{sum(self.losses_epoch) / len(self.losses_epoch):.4f}",
                 p50=f"{percentile(self.step_times, 50):.3f}s",
             )
+            if exit_requested():
+                raise KeyboardInterrupt
 
         if torch.cuda.is_available():
             self.peak_mem_bytes = max(self.peak_mem_bytes, torch.cuda.max_memory_allocated())

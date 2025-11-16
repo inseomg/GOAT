@@ -1,15 +1,101 @@
 {
   "rico": {
+    "sst2": {
+      "lr": 5e-5,
+      "weight_decay": 0.01,
+      "preset": "glue_cls"
+    },
+    "hellaswag": {
+      "lr": 3e-5,
+      "weight_decay": 0.01,
+      "preset": "mcq"
+    },
+    "squad_v2": {
+      "lr": 2e-5,
+      "weight_decay": 0.01,
+      "preset": "qa"
+    },
+    "wmt14_en_de": {
+      "lr": 1.5e-5,
+      "weight_decay": 0.01,
+      "preset": "mt"
+    },
     "xsum": {
       "lr": 1e-4,
       "weight_decay": 0.01,
-      "preset": "nlp_balanced"
+      "preset": "summ"
+    },
+    "lm_wikitext": {
+      "lr": 3e-4,
+      "weight_decay": 0.01,
+      "preset": "lm_pretrain"
+    },
+    "gsm8k": {
+      "lr": 1e-3,
+      "weight_decay": 0.0,
+      "preset": "math"
     }
   },
   "adamw": {
+    "sst2": {
+      "lr": 2e-5,
+      "weight_decay": 0.01
+    },
+    "hellaswag": {
+      "lr": 1.5e-5,
+      "weight_decay": 0.01
+    },
+    "squad_v2": {
+      "lr": 1.5e-5,
+      "weight_decay": 0.01
+    },
+    "wmt14_en_de": {
+      "lr": 4e-5,
+      "weight_decay": 0.01
+    },
     "xsum": {
       "lr": 5e-5,
       "weight_decay": 0.01
+    },
+    "lm_wikitext": {
+      "lr": 6e-4,
+      "weight_decay": 0.01
+    },
+    "gsm8k": {
+      "lr": 3e-5,
+      "weight_decay": 0.0
+    }
+  },
+  "llm": {
+    "l1_pretrain": {
+      "adamw": {
+        "lr": 6e-4,
+        "weight_decay": 0.01
+      },
+      "rico": {
+        "lr": 3e-4,
+        "weight_decay": 0.01
+      }
+    },
+    "l2_sft": {
+      "adamw": {
+        "lr": 3e-5,
+        "weight_decay": 0.01
+      },
+      "rico": {
+        "lr": 2e-5,
+        "weight_decay": 0.01
+      }
+    },
+    "l3_llama": {
+      "adamw": {
+        "lr": 2e-5,
+        "weight_decay": 0.01
+      },
+      "rico": {
+        "lr": 1.5e-5,
+        "weight_decay": 0.01
+      }
     }
   }
 }

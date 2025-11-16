@@ -2,8 +2,16 @@
 from __future__ import annotations
 import subprocess, sys
 from pathlib import Path
-from typing import List
+from typing import List, Dict
 import importlib
+
+
+REQ_IMPORT_MAP: Dict[str, str] = {
+    "pillow": "PIL",
+    "lion-pytorch": "lion_pytorch",
+    "pytorch-optimizer": "pytorch_optimizer",
+    "sentencepiece": "sentencepiece",
+}
 
 
 def _parse_requirements(path: Path) -> List[str]:
@@ -18,8 +26,9 @@ def _parse_requirements(path: Path) -> List[str]:
 
 
 def _is_installed(pkg: str) -> bool:
+    module_name = REQ_IMPORT_MAP.get(pkg.lower(), pkg)
     try:
-        importlib.import_module(pkg)
+        importlib.import_module(module_name)
         return True
     except Exception:
         return False
@@ -37,7 +46,16 @@ def check_requirements(req_path: Path) -> list[str]:
 
 def install_requirements(req_path: Path):
     """단순 래퍼. 실제로는 사용자가 직접 실행하도록 안내해도 됨."""
-    cmd = [sys.executable, "-m", "pip", "install", "-r", str(req_path)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-cache-dir",
+        "-r",
+        str(req_path),
+    ]
     print("실행 중:", " ".join(cmd))
     subprocess.run(cmd, check=False)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List
 
 import torch
@@ -14,6 +15,8 @@ import torchvision.models.segmentation as seg_models
 from torch.utils.data import DataLoader, Subset
 
 from goat_bench.optimizers.builder import build_optimizer
+from goat_bench.utils.checkpointing import save_checkpoint
+from goat_bench.utils.helpers import ensure_dir
 
 from .config import CVTaskConfig
 from .datasets import ADE20K, CocoDet, collate_det, get_cls_datasets
@@ -22,6 +25,8 @@ from .utils import human_mb, percentile, set_seed, subset_dataset, write_csv_row
 
 
 _cpu_warned = False
+_CKPT_ROOT = Path(__file__).resolve().parents[2] / "results" / "checkpoints"
+_CLS_DATA_DIR_ALIASES = {"imagenet": "imagenet1k"}
 
 
 def _warn_if_cpu_only():
@@ -39,13 +44,20 @@ def get_cls_model(num_classes: int, input_size: int, model_name: str = "resnet50
         "resnet50": models.resnet50,
         "resnet101": models.resnet101,
         "resnet152": models.resnet152,
+        "densenet121": models.densenet121,
+        "densenet169": models.densenet169,
     }
     if model_name not in factories:
         raise ValueError(f"unknown model: {model_name}")
     model = factories[model_name](weights=None, num_classes=num_classes)
     if input_size < 112:
-        model.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        model.maxpool = torch.nn.Identity()
+        if hasattr(model, "conv1") and hasattr(model, "maxpool"):
+            model.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            model.maxpool = torch.nn.Identity()
+        elif hasattr(model, "features") and hasattr(model.features, "conv0"):
+            model.features.conv0 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+            if hasattr(model.features, "pool0"):
+                model.features.pool0 = torch.nn.Identity()
     return model
 
 
@@ -114,9 +126,26 @@ def _finalize_summary(summary: Dict[str, Any], log_json: Path | None):
         json.dump(summary, f, indent=2)
 
 
+def _resolve_cls_data_root(base: Path, dataset: str) -> Path:
+    dataset_lower = dataset.lower()
+    alias = _CLS_DATA_DIR_ALIASES.get(dataset_lower, dataset_lower)
+    names = [dataset_lower]
+    if alias not in names:
+        names.append(alias)
+
+    if base.name.lower() in names:
+        return base
+
+    for name in names:
+        candidate = base / name
+        if candidate.exists():
+            return candidate
+    return base / names[-1]
+
+
 def run_classification(cfg: CVTaskConfig) -> Dict[str, Any]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    data_root = Path(cfg.data_dir)
+    data_root = _resolve_cls_data_root(Path(cfg.data_dir), cfg.dataset)
     train_set, val_set, num_classes, input_size = get_cls_datasets(cfg.dataset, data_root)
     train_set = subset_dataset(train_set, cfg.subset_frac, cfg.seed)
     val_set = subset_dataset(val_set, max(cfg.subset_frac, 0.2), cfg.seed)
@@ -175,35 +204,53 @@ def run_classification(cfg: CVTaskConfig) -> Dict[str, Any]:
     best = -1e9
     wall0 = time.perf_counter()
     val_summary: Dict[str, Any] = {}
-    for epoch in range(1, epochs + 1):
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        trainer.train_one_epoch(train_loader, epoch, epochs)
-        train_summary = trainer.summarize_train_epoch()
-        val_summary = trainer.evaluate_one_epoch(val_loader)
-        sch.step()
-        best = max(best, val_summary["val_top1"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        row = {
-            "epoch": epoch,
-            "lr": sch.get_last_lr()[0],
-            **train_summary,
-            **val_summary,
-            "best_val": best,
-            "peak_mem_mb": human_mb(peak),
-        }
-        write_csv_row(csv_path, row, header_first=(epoch == 1))
-        print(
-            "[CLS][Epoch {epoch}/{epochs}] top1 {top1:.2f} | best {best:.2f} | p99 {p99:.3f}s | thru {thru:.1f} img/s | LR {lr:.6f}".format(
-                epoch=epoch,
-                epochs=epochs,
-                top1=val_summary["val_top1"],
-                best=best,
-                p99=train_summary["step_p99_sec"],
-                thru=train_summary["throughput"],
-                lr=row["lr"],
+    last_val_summary: Dict[str, Any] = {}
+    interrupted_ckpt = None
+    current_epoch = 0
+    try:
+        for epoch in range(1, epochs + 1):
+            current_epoch = epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            trainer.train_one_epoch(train_loader, epoch, epochs)
+            train_summary = trainer.summarize_train_epoch()
+            val_summary = trainer.evaluate_one_epoch(val_loader)
+            last_val_summary = val_summary
+            sch.step()
+            best = max(best, val_summary["val_top1"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            row = {
+                "epoch": epoch,
+                "lr": sch.get_last_lr()[0],
+                **train_summary,
+                **val_summary,
+                "best_val": best,
+                "peak_mem_mb": human_mb(peak),
+            }
+            write_csv_row(csv_path, row, header_first=(epoch == 1))
+            print(
+                "[CLS][Epoch {epoch}/{epochs}] top1 {top1:.2f} | best {best:.2f} | p99 {p99:.3f}s | thru {thru:.1f} img/s | LR {lr:.6f}".format(
+                    epoch=epoch,
+                    epochs=epochs,
+                    top1=val_summary["val_top1"],
+                    best=best,
+                    p99=train_summary["step_p99_sec"],
+                    thru=train_summary["throughput"],
+                    lr=row["lr"],
+                )
             )
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_cv_checkpoint(
+            "cls",
+            cfg,
+            model,
+            opt,
+            sch,
+            current_epoch,
+            best,
+            {"val_summary": last_val_summary},
         )
+        print(f"[CLS] 'exit' 신호를 감지했습니다. 체크포인트 저장: {interrupted_ckpt}")
 
     total_sec = time.perf_counter() - wall0
     peak_all = trainer.peak_mem_bytes
@@ -225,6 +272,9 @@ def run_classification(cfg: CVTaskConfig) -> Dict[str, Any]:
         "peak_mem_mb": round(peak_all / (1024 * 1024), 2),
         "total_time_sec": total_sec,
     }
+    summary["interrupted"] = interrupted_ckpt is not None
+    if interrupted_ckpt:
+        summary["checkpoint"] = str(interrupted_ckpt)
     log_json = Path(cfg.log_json) if cfg.log_json else None
     _finalize_summary(summary, log_json)
     print("[CLS][SUMMARY]", json.dumps(summary, indent=2))
@@ -287,35 +337,53 @@ def run_detection(cfg: CVTaskConfig) -> Dict[str, Any]:
     best = -1e9
     wall0 = time.perf_counter()
     val_summary: Dict[str, Any] = {}
-    for epoch in range(1, epochs + 1):
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        trainer.train_one_epoch(train_loader, epoch, epochs)
-        train_summary = trainer.summarize_train_epoch()
-        val_summary = trainer.evaluate_one_epoch(val_loader)
-        sch.step()
-        best = max(best, val_summary["val_mAP"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        row = {
-            "epoch": epoch,
-            "lr": sch.get_last_lr()[0],
-            **train_summary,
-            **val_summary,
-            "best_val": best,
-            "peak_mem_mb": human_mb(peak),
-        }
-        write_csv_row(csv_path, row, header_first=(epoch == 1))
-        print(
-            "[DET][Epoch {epoch}/{epochs}] mAP {map:.2f} | best {best:.2f} | p99 {p99:.3f}s | thru {thru:.1f} img/s | LR {lr:.6f}".format(
-                epoch=epoch,
-                epochs=epochs,
-                map=val_summary["val_mAP"],
-                best=best,
-                p99=train_summary["step_p99_sec"],
-                thru=train_summary["throughput"],
-                lr=row["lr"],
+    last_val_summary: Dict[str, Any] = {}
+    interrupted_ckpt = None
+    current_epoch = 0
+    try:
+        for epoch in range(1, epochs + 1):
+            current_epoch = epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            trainer.train_one_epoch(train_loader, epoch, epochs)
+            train_summary = trainer.summarize_train_epoch()
+            val_summary = trainer.evaluate_one_epoch(val_loader)
+            last_val_summary = val_summary
+            sch.step()
+            best = max(best, val_summary["val_mAP"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            row = {
+                "epoch": epoch,
+                "lr": sch.get_last_lr()[0],
+                **train_summary,
+                **val_summary,
+                "best_val": best,
+                "peak_mem_mb": human_mb(peak),
+            }
+            write_csv_row(csv_path, row, header_first=(epoch == 1))
+            print(
+                "[DET][Epoch {epoch}/{epochs}] mAP {map:.2f} | best {best:.2f} | p99 {p99:.3f}s | thru {thru:.1f} img/s | LR {lr:.6f}".format(
+                    epoch=epoch,
+                    epochs=epochs,
+                    map=val_summary["val_mAP"],
+                    best=best,
+                    p99=train_summary["step_p99_sec"],
+                    thru=train_summary["throughput"],
+                    lr=row["lr"],
+                )
             )
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_cv_checkpoint(
+            "det",
+            cfg,
+            model,
+            opt,
+            sch,
+            current_epoch,
+            best,
+            {"val_summary": last_val_summary},
         )
+        print(f"[DET] 'exit' 신호를 감지했습니다. 체크포인트 저장: {interrupted_ckpt}")
 
     total_sec = time.perf_counter() - wall0
     peak_all = trainer.peak_mem_bytes
@@ -335,6 +403,9 @@ def run_detection(cfg: CVTaskConfig) -> Dict[str, Any]:
         "peak_mem_mb": round(peak_all / (1024 * 1024), 2),
         "total_time_sec": total_sec,
     }
+    summary["interrupted"] = interrupted_ckpt is not None
+    if interrupted_ckpt:
+        summary["checkpoint"] = str(interrupted_ckpt)
     log_json = Path(cfg.log_json) if cfg.log_json else None
     _finalize_summary(summary, log_json)
     print("[DET][SUMMARY]", json.dumps(summary, indent=2))
@@ -385,35 +456,53 @@ def run_segmentation(cfg: CVTaskConfig) -> Dict[str, Any]:
     best = -1e9
     wall0 = time.perf_counter()
     val_summary: Dict[str, Any] = {}
-    for epoch in range(1, epochs + 1):
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        trainer.train_one_epoch(train_loader, epoch, epochs)
-        train_summary = trainer.summarize_train_epoch()
-        val_summary = trainer.evaluate_one_epoch(val_loader)
-        sch.step()
-        best = max(best, val_summary["val_mIoU"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        row = {
-            "epoch": epoch,
-            "lr": sch.get_last_lr()[0],
-            **train_summary,
-            **val_summary,
-            "best_val": best,
-            "peak_mem_mb": human_mb(peak),
-        }
-        write_csv_row(csv_path, row, header_first=(epoch == 1))
-        print(
-            "[SEG][Epoch {epoch}/{epochs}] mIoU {miou:.2f} | best {best:.2f} | p99 {p99:.3f}s | thru {thru:.1f} img/s | LR {lr:.6f}".format(
-                epoch=epoch,
-                epochs=epochs,
-                miou=val_summary["val_mIoU"],
-                best=best,
-                p99=train_summary["step_p99_sec"],
-                thru=train_summary["throughput"],
-                lr=row["lr"],
+    last_val_summary: Dict[str, Any] = {}
+    interrupted_ckpt = None
+    current_epoch = 0
+    try:
+        for epoch in range(1, epochs + 1):
+            current_epoch = epoch
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            trainer.train_one_epoch(train_loader, epoch, epochs)
+            train_summary = trainer.summarize_train_epoch()
+            val_summary = trainer.evaluate_one_epoch(val_loader)
+            last_val_summary = val_summary
+            sch.step()
+            best = max(best, val_summary["val_mIoU"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            row = {
+                "epoch": epoch,
+                "lr": sch.get_last_lr()[0],
+                **train_summary,
+                **val_summary,
+                "best_val": best,
+                "peak_mem_mb": human_mb(peak),
+            }
+            write_csv_row(csv_path, row, header_first=(epoch == 1))
+            print(
+                "[SEG][Epoch {epoch}/{epochs}] mIoU {miou:.2f} | best {best:.2f} | p99 {p99:.3f}s | thru {thru:.1f} img/s | LR {lr:.6f}".format(
+                    epoch=epoch,
+                    epochs=epochs,
+                    miou=val_summary["val_mIoU"],
+                    best=best,
+                    p99=train_summary["step_p99_sec"],
+                    thru=train_summary["throughput"],
+                    lr=row["lr"],
+                )
             )
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_cv_checkpoint(
+            "seg",
+            cfg,
+            model,
+            opt,
+            sch,
+            current_epoch,
+            best,
+            {"val_summary": last_val_summary},
         )
+        print(f"[SEG] 'exit' 신호를 감지했습니다. 체크포인트 저장: {interrupted_ckpt}")
 
     total_sec = time.perf_counter() - wall0
     peak_all = trainer.peak_mem_bytes
@@ -433,6 +522,9 @@ def run_segmentation(cfg: CVTaskConfig) -> Dict[str, Any]:
         "peak_mem_mb": round(peak_all / (1024 * 1024), 2),
         "total_time_sec": total_sec,
     }
+    summary["interrupted"] = interrupted_ckpt is not None
+    if interrupted_ckpt:
+        summary["checkpoint"] = str(interrupted_ckpt)
     log_json = Path(cfg.log_json) if cfg.log_json else None
     _finalize_summary(summary, log_json)
     print("[SEG][SUMMARY]", json.dumps(summary, indent=2))
@@ -450,3 +542,21 @@ def run_task(cfg: CVTaskConfig) -> Dict[str, Any]:
     if task == "seg":
         return run_segmentation(cfg)
     raise ValueError(f"Unknown CV task: {cfg.task}")
+def _save_cv_checkpoint(tag: str, cfg: CVTaskConfig, model, optimizer, scheduler, epoch: int, best: float, extra: Dict[str, Any]):
+    ensure_dir(_CKPT_ROOT)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dataset = getattr(cfg, "dataset", tag)
+    path = _CKPT_ROOT / f"{tag}_{dataset}_epoch{epoch}_{stamp}.pt"
+    state = {
+        "task": tag,
+        "dataset": dataset,
+        "epoch": epoch,
+        "best_metric": best,
+        "config": cfg.__dict__,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict(),
+        **extra,
+    }
+    save_checkpoint(path, state)
+    return path

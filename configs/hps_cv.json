@@ -1,5 +1,10 @@
 {
   "rico": {
+    "cifar100": {
+      "lr": 0.18,
+      "weight_decay": 0.05,
+      "preset": "cifar_resnet"
+    },
     "cifar10": {
       "lr": 0.3,
       "weight_decay": 0.05,
@@ -9,9 +14,28 @@
       "lr": 0.2,
       "weight_decay": 0.05,
       "preset": "balanced"
+    },
+    "imagenet": {
+      "lr": 0.12,
+      "weight_decay": 0.02,
+      "preset": "imagenet_resnet"
+    },
+    "coco2017": {
+      "lr": 0.02,
+      "weight_decay": 0.0001,
+      "preset": "detection_default"
+    },
+    "ade20k": {
+      "lr": 0.015,
+      "weight_decay": 0.0001,
+      "preset": "segmentation_default"
     }
   },
   "adamw": {
+    "cifar100": {
+      "lr": 0.12,
+      "weight_decay": 0.0005
+    },
     "cifar10": {
       "lr": 0.1,
       "weight_decay": 0.0005
@@ -19,6 +43,28 @@
     "tinyimagenet": {
       "lr": 0.05,
       "weight_decay": 0.0005
+    },
+    "imagenet": {
+      "lr": 0.003,
+      "weight_decay": 0.05
+    },
+    "coco2017": {
+      "lr": 0.0002,
+      "weight_decay": 0.0001
+    },
+    "ade20k": {
+      "lr": 0.0003,
+      "weight_decay": 0.0001
+    }
+  },
+  "models": {
+    "classification": {
+      "resnet50": {
+        "label_smoothing": 0.1
+      },
+      "densenet121": {
+        "label_smoothing": 0.05
+      }
     }
   }
 }

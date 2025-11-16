@@ -2,6 +2,7 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
+import time
 
 # 로컬 모듈
 from setup.env_check import run_env_setup
@@ -21,12 +22,22 @@ from goat_bench.utils.results import show_results_menu
 
 
 ROOT = Path(__file__).resolve().parent
+ASCII_GOAT = [
+    r"  /\_/\\ ",
+    r" ( o.o )",
+    r"  > ^ < ",
+]
+MENU_FRAMES = ["◈", "◆", "◇", "◆"]
 
 
 def main():
     while True:
         clear_screen()
-        print_header("GOAT Benchmark")
+        frame = MENU_FRAMES[int(time.time() * 3) % len(MENU_FRAMES)]
+        print_header(f"{frame} GOAT Benchmark {frame}")
+        for line in ASCII_GOAT:
+            print(f"        {line}")
+        print()
 
         print(" [1] 환경 / 의존성 체크 (requirements)")
         print(" [2] 데이터셋 관리 (다운로드 / 상태 확인)")

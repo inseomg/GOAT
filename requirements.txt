@@ -1,0 +1,17 @@
+torch
+torchvision
+tqdm
+numpy
+pillow
+pycocotools
+lion-pytorch
+pytorch-optimizer
+datasets
+transformers
+evaluate
+sacrebleu
+sentencepiece
+rouge-score
+scipy
+accelerate
+absl-py
