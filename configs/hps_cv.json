@@ -1,0 +1,24 @@
+{
+  "rico": {
+    "cifar10": {
+      "lr": 0.3,
+      "weight_decay": 0.05,
+      "preset": "balanced"
+    },
+    "tinyimagenet": {
+      "lr": 0.2,
+      "weight_decay": 0.05,
+      "preset": "balanced"
+    }
+  },
+  "adamw": {
+    "cifar10": {
+      "lr": 0.1,
+      "weight_decay": 0.0005
+    },
+    "tinyimagenet": {
+      "lr": 0.05,
+      "weight_decay": 0.0005
+    }
+  }
+}
