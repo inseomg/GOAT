@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os
 import shutil
+import inspect
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -96,7 +97,22 @@ def has_dataset(ds_name: str, data_root: Path) -> bool:
         except Exception:
             return False
     if name in _HF_NLP_DATASETS:
-        return path.exists() and any(path.iterdir())
+        if path.exists() and any(path.iterdir()):
+            return True
+        # fallback: check shared HF cache (when cache_dir wasn't dataset-specific)
+        base = Path(data_root) / "hf-cache"
+        candidates = [
+            base / "datasets",
+            base / "hub",
+        ]
+        tokens = {name, name.replace("_", "-")}
+        for cand in candidates:
+            if not cand.exists():
+                continue
+            for sub in cand.glob("*"):
+                if any(tok in sub.name for tok in tokens):
+                    return True
+        return False
     return path.exists() and any(path.iterdir())
 
 
@@ -124,6 +140,62 @@ def _download_tinyimagenet(root: Path):
     ensure_tinyimagenet(root)
 
 
+_TRUST_REMOTE_CODE_SUPPORTED: bool | None = None
+
+
+def _supports_trust_remote_code(load_dataset) -> bool:
+    global _TRUST_REMOTE_CODE_SUPPORTED
+    if _TRUST_REMOTE_CODE_SUPPORTED is None:
+        try:
+            sig = inspect.signature(load_dataset)
+            _TRUST_REMOTE_CODE_SUPPORTED = "trust_remote_code" in sig.parameters
+        except Exception:
+            _TRUST_REMOTE_CODE_SUPPORTED = False
+    return bool(_TRUST_REMOTE_CODE_SUPPORTED)
+
+
+def _load_dataset_compat(hf_name: str, subset: Optional[str], cache_dir: Path, *, trust_remote_code: bool, revision: Optional[str] = None):
+    """
+    Wrapper for datasets.load_dataset that copes with:
+      - newer versions deprecating trust_remote_code
+      - community datasets that still require trust_remote_code=True
+      - numpy/Scipy ABI errors (e.g., numpy 2.3.x + scipy) with actionable guidance
+    """
+    from datasets import load_dataset  # type: ignore
+
+    supports_trc = _supports_trust_remote_code(load_dataset)
+    kwargs = {"cache_dir": str(cache_dir)}
+    if revision:
+        kwargs["revision"] = revision
+
+    def _call(use_trust: bool):
+        opts = dict(kwargs)
+        if use_trust and supports_trc:
+            opts["trust_remote_code"] = True
+        return load_dataset(hf_name, subset, **opts)
+
+    try:
+        return _call(trust_remote_code)
+    except TypeError as exc:
+        if "trust_remote_code" in str(exc):
+            return _call(False)
+        raise
+    except ValueError as exc:
+        msg = str(exc)
+        if "trust_remote_code is not supported anymore" in msg:
+            return _call(False)
+        if "trust_remote_code=True" in msg and supports_trc and not trust_remote_code:
+            return _call(True)
+        raise
+    except ImportError as exc:
+        if "_center" in str(exc) and "numpy" in str(exc):
+            raise RuntimeError(
+                "데이터셋 로딩 중 numpy/Scipy ABI 오류가 발생했습니다. "
+                "requirements.txt 버전에 맞춰 `pip install 'numpy>=1.26,<2.2' 'scipy>=1.10,<1.13' --upgrade --force-reinstall` 를 실행하세요."
+            ) from exc
+        raise
+
+
 def _download_hf_dataset(dataset_key: str, hf_name: str, subset: Optional[str] = None, *, trust_remote_code: bool = False):
     def _runner(root: Path):
         try:
@@ -131,8 +203,11 @@ def _download_hf_dataset(dataset_key: str, hf_name: str, subset: Optional[str] =
         except ImportError as exc:
             raise RuntimeError("`datasets` 패키지가 필요합니다. pip install datasets 로 설치하세요.") from exc
         ensure_dir(root)
-        print(f"[HF] {hf_name}{f'/{subset}' if subset else ''} 다운로드를 시작합니다 (cache_dir={root})")
-        load_dataset(hf_name, subset, cache_dir=str(root), trust_remote_code=trust_remote_code)
+        base_cache = root.parent if root.parent.name == "hf-cache" else configure_hf_cache(root)
+        print(f"[HF] {hf_name}{f'/{subset}' if subset else ''} 다운로드를 시작합니다 (cache_dir={base_cache})")
+        _load_dataset_compat(hf_name, subset, base_cache, trust_remote_code=trust_remote_code)
+        # marker so has_dataset() reports ready even though cache is shared
+        (root / ".ready").write_text("ready", encoding="utf-8")
         print("[HF] 다운로드 완료")
 
     return _runner
@@ -158,9 +233,8 @@ def _download_xsum_dataset(root: Path):
         try:
             _purge_hf_cache(root, ["xsum", "GEM--xsum", "EdinburghNLP--xsum"])
             print(f"[HF] {hf_name}{f'/{subset}' if subset else ''} 다운로드를 시도합니다 (cache_dir={root})")
-            from datasets import load_dataset  # type: ignore
-
-            load_dataset(hf_name, subset, cache_dir=str(root), trust_remote_code=True, revision=revision)
+            base_cache = root.parent if root.parent.name == "hf-cache" else configure_hf_cache(root)
+            _load_dataset_compat(hf_name, subset, base_cache, trust_remote_code=True, revision=revision)
             (root / ".ready_xsum").write_text("ready", encoding="utf-8")
             print("[HF] XSum 다운로드 완료")
             return
@@ -182,13 +256,12 @@ def _download_alpha_nli(root: Path):
         ("allenai/art", "anli"),
     ]
     tried = []
-    from datasets import load_dataset  # type: ignore
-
     for candidate, subset in candidates:
         tried.append(candidate if subset is None else f"{candidate}/{subset}")
         try:
             print(f"[HF] {candidate}{f'/{subset}' if subset else ''} 다운로드를 시작합니다 (cache_dir={root})")
-            load_dataset(candidate, subset, cache_dir=str(root), trust_remote_code=True)
+            base_cache = root.parent if root.parent.name == "hf-cache" else configure_hf_cache(root)
+            _load_dataset_compat(candidate, subset, base_cache, trust_remote_code=True)
             marker = root / ".ready_alpha_nli"
             marker.write_text("ready", encoding="utf-8")
             print("[HF] 다운로드 완료")
@@ -201,7 +274,6 @@ def _download_alpha_nli(root: Path):
 def _download_wmt(direction: str):
     def _runner(root: Path):
         ensure_dir(root)
-        from datasets import load_dataset  # type: ignore
 
         possible = [direction, "-".join(reversed(direction.split("-")))]
         base_configs = ["cs-en", "de-en", "fr-en", "hi-en", "ru-en"]
@@ -212,7 +284,8 @@ def _download_wmt(direction: str):
         for cfg in possible:
             try:
                 print(f"[HF] wmt14/{cfg} 다운로드를 시작합니다 (cache_dir={root})")
-                load_dataset("wmt14", cfg, cache_dir=str(root), trust_remote_code=True)
+                base_cache = root.parent if root.parent.name == "hf-cache" else configure_hf_cache(root)
+                _load_dataset_compat("wmt14", cfg, base_cache, trust_remote_code=True)
                 marker = root / f".ready_wmt14_{direction}"
                 marker.write_text("ready", encoding="utf-8")
                 print("[HF] 다운로드 완료")

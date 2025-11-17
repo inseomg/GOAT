@@ -45,14 +45,18 @@ def _prompt_float(text: str, default: float) -> float:
         return default
 
 
-def _select_from(options: list[str], default_idx: int, label: str) -> str:
+def _select_from(options: list[str], default_idx: int, label: str, allow_cancel: bool = False) -> str | None:
     print(f"{label}:")
     for idx, opt in enumerate(options, start=1):
         flag = "(기본)" if (idx - 1) == default_idx else ""
         print(f"  [{idx}] {opt} {flag}")
+    if allow_cancel:
+        print("  [0] 취소/뒤로가기")
     choice = input(" 번호 선택 >> ").strip()
     if not choice:
         return options[default_idx]
+    if allow_cancel and choice == "0":
+        return None
     try:
         idx = int(choice) - 1
         if 0 <= idx < len(options):
@@ -186,8 +190,10 @@ CV_SMOKE_SCENARIOS = [
 ]
 
 
-def _build_cv_config(task: str) -> CVTaskConfig:
-    mode = _select_from(["빠른 실행 (기본 설정)", "상세 설정"], 0, "실행 모드")
+def _build_cv_config(task: str) -> Optional[CVTaskConfig]:
+    mode = _select_from(["빠른 실행 (기본 설정)", "상세 설정"], 0, "실행 모드", allow_cancel=True)
+    if mode is None:
+        return None  # type: ignore
     if mode.startswith("빠른"):
         return _default_cv_config(task)
 
@@ -197,12 +203,17 @@ def _build_cv_config(task: str) -> CVTaskConfig:
     epochs: Optional[int] = None
 
     if task == "cls":
-        dataset = _select_from(["cifar100", "tinyimagenet", "imagenet"], 0, "분류 Dataset")
+        dataset = _select_from(["cifar100", "tinyimagenet", "imagenet"], 0, "분류 Dataset", allow_cancel=True)
+        if dataset is None:
+            return None  # type: ignore
         model = _select_from(
             ["resnet18", "resnet34", "resnet50", "resnet101", "resnet152", "densenet121", "densenet169"],
             2,
             "Backbone",
+            allow_cancel=True,
         )
+        if model is None:
+            return None  # type: ignore
         batch_input = _prompt_int("배치 사이즈", 128)
         batch = batch_input or 128
         batch_override = batch_input is not None
@@ -364,6 +375,10 @@ def run_benchmark_menu():
             input("엔터를 눌러 계속하세요...")
             continue
         cfg = _build_cv_config(task)
+        if cfg is None:
+            print("실행을 취소했습니다.")
+            input("엔터를 눌러 계속하세요...")
+            continue
         try:
             from .cv.runners import run_task
 

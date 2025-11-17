@@ -269,10 +269,18 @@ def build_multirc_loaders(mdl_name:str, batch:int, workers:int, max_len:int=256)
 
     def _encode_single(ex):
         out = []
-        qid = int(ex["idx"]["question"])
-        para = ex["paragraph"]
-        ques = ex["question"]
-        for aid, ans in enumerate(ex["answers"]):
+        idx = ex.get("idx", {})
+        qid = int(idx.get("question", idx.get("qid", 0)))
+        para = ex.get("paragraph", "")
+        ques = ex.get("question", "")
+        answers = ex.get("answers")
+        # 일부 스냅샷에서는 이미 단일 정답/라벨 필드로 flatten되어 있음
+        if answers is None:
+            answers = [{
+                "text": ex.get("answer") or ex.get("text") or "",
+                "label": int(ex.get("label", 0)),
+            }]
+        for aid, ans in enumerate(answers):
             text_ans = ans.get("text","")
             label = int(ans.get("label", 0))
             enc = tok(ques + " " + text_ans, para, truncation=True, max_length=max_len)

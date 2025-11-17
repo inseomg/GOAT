@@ -172,10 +172,16 @@ def _dataset_ready(data_root: Path, task_key: str) -> bool:
     }
     if task_key in suites:
         return all(_dataset_ready(data_root, t) for t in suites[task_key])
-    # HF datasets live under data/hf-cache/<name>
-    ds_name = task_key
-    path = dataset_root(data_root, ds_name)
-    return path.exists() and any(path.iterdir())
+    ds_map = {
+        "lm": "wikitext2",  # task key -> dataset key in registry
+    }
+    ds_name = ds_map.get(task_key, task_key)
+    try:
+        return has_dataset(ds_name, data_root)
+    except KeyError:
+        # fallback: check presence under hf-cache
+        path = dataset_root(data_root, ds_name)
+        return path.exists() and any(path.iterdir())
 
 
 def run_nlp_menu(data_root: Path):
@@ -294,7 +300,11 @@ def _run_task_via_cli(
     print(info.description)
     print(f" 기본 모델: {info.default_model or 'script 기본값'}")
     print(f" 스크립트: {script_path.name}")
-    if info.heavy_warning:
+    default_cache = Path(__file__).resolve().parents[3] / "data" / "hf-cache"
+    cache_dir = Path(env.get("HF_DATASETS_CACHE", default_cache))
+    data_root = cache_dir.parent  # expected: .../data
+    ready = _dataset_ready(data_root, info.key)
+    if info.heavy_warning and not ready:
         print(" ⚠️ 해당 태스크는 대용량 데이터(Hugging Face) 다운로드가 필요합니다.")
         ans = input(" 계속 진행하시겠습니까? [y/N] >> ").strip().lower()
         if ans not in ("y", "yes"):
@@ -315,7 +325,10 @@ def _run_task_via_cli(
     print("--------------------------------------------------")
     print(" [1] 빠른 실행 (AdamW, 기본 epoch/batch)")
     print(" [2] 고급 설정 (optimizer/model/lr 등 세부 조정)")
+    print(" [0] 취소/뒤로가기")
     mode = input(" 선택 >> ").strip() or "1"
+    if mode == "0":
+        return
 
     optimizer = "adamw"
     model = info.default_model or ""

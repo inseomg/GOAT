@@ -226,6 +226,7 @@ try:
     from datasets import load_dataset
 except Exception as e:
     raise RuntimeError("`pip install datasets` 필요") from e
+import inspect
 
 # transformers 모델
 try:
@@ -265,16 +266,73 @@ def _purge_cache_entry(names: list[str]):
                 shutil.rmtree(sub, ignore_errors=True)
 
 
-def _hf_load(name: str, subset: str | None = None):
+_TRUST_REMOTE_CODE_SUPPORTED: bool | None = None
+
+
+def _supports_trust_remote_code() -> bool:
+    global _TRUST_REMOTE_CODE_SUPPORTED
+    if _TRUST_REMOTE_CODE_SUPPORTED is None:
+        try:
+            sig = inspect.signature(load_dataset)
+            _TRUST_REMOTE_CODE_SUPPORTED = "trust_remote_code" in sig.parameters
+        except Exception:
+            _TRUST_REMOTE_CODE_SUPPORTED = False
+    return bool(_TRUST_REMOTE_CODE_SUPPORTED)
+
+
+def _load_dataset_compat(name: str, subset: str | None, *, allow_remote: bool):
+    """
+    Load a dataset while handling:
+      - new datasets versions that reject trust_remote_code
+      - remote/community datasets that still require trust_remote_code=True
+      - numpy/scipy ABI mismatches (gives actionable hint)
+    """
+    kwargs = {"cache_dir": str(HF_CACHE)}
+    supports_trc = _supports_trust_remote_code()
+
+    def _call(trust_remote: bool):
+        opts = dict(kwargs)
+        if trust_remote and supports_trc:
+            opts["trust_remote_code"] = True
+        return load_dataset(name, subset, **opts)
+
     try:
-        return load_dataset(name, subset, cache_dir=str(HF_CACHE), trust_remote_code=True)
+        return _call(allow_remote)
+    except TypeError as exc:
+        # Older/newer datasets may not accept the argument
+        if "trust_remote_code" in str(exc):
+            return _call(False)
+        raise
+    except ValueError as exc:
+        msg = str(exc)
+        # Newer datasets: "trust_remote_code is not supported anymore"
+        if "trust_remote_code is not supported anymore" in msg:
+            return _call(False)
+        # Community datasets that insist on trust_remote_code=True
+        if "trust_remote_code=True" in msg and supports_trc and not allow_remote:
+            return _call(True)
+        raise
+    except ImportError as exc:
+        # numpy 2.3.x + scipy wheels can break with `_center` import errors
+        if "_center" in str(exc) and "numpy" in str(exc):
+            raise RuntimeError(
+                "HF 데이터셋 로딩 중 numpy/Scipy ABI 오류가 발생했습니다. "
+                "requirements.txt 버전에 맞춰 `pip install 'numpy>=1.26,<2.2' 'scipy>=1.10,<1.13' --upgrade --force-reinstall` 를 실행하세요."
+            ) from exc
+        raise
+
+
+def _hf_load(name: str, subset: str | None = None):
+    allow_remote = "/" in name or name in {"abductive_nli", "abductive-nli", "allenai/art", "Rowan/hellaswag"}
+    try:
+        return _load_dataset_compat(name, subset, allow_remote=allow_remote)
     except Exception as exc:
         # Legacy script error: purge cache and try once more
         msg = str(exc)
         if "xsum.py" in msg or "script" in msg:
             patterns = [name, name.replace("/", "--")]
             _purge_cache_entry(patterns)
-            return load_dataset(name, subset, cache_dir=str(HF_CACHE), trust_remote_code=True)
+            return _load_dataset_compat(name, subset, allow_remote=allow_remote)
         raise
 
 from datetime import datetime

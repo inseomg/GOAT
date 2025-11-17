@@ -1,17 +1,18 @@
-torch
-torchvision
-tqdm
-numpy
-pillow
-pycocotools
-lion-pytorch
-pytorch-optimizer
-datasets
-transformers
-evaluate
-sacrebleu
-sentencepiece
-rouge-score
-scipy
-accelerate
-absl-py
+torch>=2.8.0,<2.9
+torchvision>=0.23.0,<0.24
+tqdm>=4.66,<5
+numpy>=1.26,<2.2          # keep TF/numba/opencv compatible
+pillow>=9.0.0,<12.0.0     # gradio constraint
+pycocotools>=2.0.6,<3
+lion-pytorch==0.2.3
+pytorch-optimizer>=2.12,<3
+datasets>=2.16,<3.0       # avoid trust_remote_code removal in bleeding-edge releases
+transformers>=4.38,<5
+evaluate>=0.4,<0.5
+sacrebleu>=2.3,<3
+sentencepiece>=0.2.0,<0.3
+rouge-score>=0.1.2,<0.2
+scipy>=1.10,<1.13
+accelerate>=0.28,<1
+absl-py>=1.4,<3
+packaging>=23,<25

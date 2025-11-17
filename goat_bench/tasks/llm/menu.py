@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 import sys
@@ -13,6 +14,8 @@ from goat_bench.utils.helpers import (
     configure_hf_cache,
     ConsoleSpinner,
 )
+from setup.prepare_data import has_dataset, download_dataset
+import torch
 
 SCRIPT_PATH = Path(__file__).resolve().with_name("bench.py")
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,7 +76,58 @@ LLM_SMOKE_SCENARIOS = [
 ]
 
 
+_LLM_DATASET_MAP: Dict[str, str] = {
+    "l1_pretrain": "wikitext103",
+    "l2_sft": "alpaca",
+    "l3_llama": "alpaca",
+}
+
+_LLM_MODEL_DEFAULTS: Dict[str, str] = {
+    "l1_pretrain": "gpt2",
+    "l2_sft": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "l3_llama": "mistralai/Mistral-7B-v0.1",
+}
+
+
+def _llm_dataset_ready(task_key: str) -> bool:
+    ds = _LLM_DATASET_MAP.get(task_key)
+    if not ds:
+        return True
+    try:
+        return has_dataset(ds, DATA_DIR)
+    except Exception:
+        return False
+
+
 def _run_llm_task(task_key: str, optimizer: str, extra: List[str]):
+    ds = _LLM_DATASET_MAP.get(task_key)
+    if ds and not _llm_dataset_ready(task_key):
+        print(f"[INFO] '{ds}' 데이터셋이 준비되어 있지 않습니다.")
+        ans = input(" 자동으로 다운로드할까요? [y/N] >> ").strip().lower()
+        if ans in ("y", "yes"):
+            download_dataset(ds, DATA_DIR, pause=False)
+        else:
+            print("취소되었습니다.")
+            return
+    # ensure model is specified; fall back to defaults per task
+    flags = {extra[i]: extra[i + 1] if i + 1 < len(extra) else None for i in range(0, len(extra) - 1, 2) if extra[i].startswith("--")}
+    if "--model-name" not in flags and "--model" not in flags:
+        default_model = _LLM_MODEL_DEFAULTS.get(task_key)
+        if default_model:
+            extra = ["--model-name", default_model, *extra]
+    # CPU 환경에서는 amp를 none으로 강제
+    if not torch.cuda.is_available():
+        cleaned: List[str] = []
+        skip = False
+        for i, tok in enumerate(extra):
+            if skip:
+                skip = False
+                continue
+            if tok == "--amp":
+                skip = True
+                continue
+            cleaned.append(tok)
+        extra = ["--amp", "none", *cleaned]
     env = os.environ.copy()
     env["PYTHONPATH"] = os.pathsep.join([str(ROOT), env.get("PYTHONPATH", "")])
     cmd = [sys.executable, str(SCRIPT_PATH), "--task", task_key, "--optimizer", optimizer, *extra]
@@ -81,7 +135,9 @@ def _run_llm_task(task_key: str, optimizer: str, extra: List[str]):
     spinner = ConsoleSpinner(f"[LLM] {task_key} 실행 중")
     spinner.start()
     try:
-        subprocess.run(cmd, check=False, env=env)
+        result = subprocess.run(cmd, check=False, env=env)
+        if result.returncode != 0:
+            print(f"[ERROR] LLM 작업이 비정상 종료(returncode={result.returncode}). 로그를 확인하세요.")
     finally:
         spinner.stop()
 
@@ -124,6 +180,10 @@ def run_llm_menu():
             except ValueError:
                 print("인자 파싱 실패. 기본 옵션으로 실행합니다.")
                 extra = []
+        print(" [0] 취소 / [Enter] 계속 실행")
+        confirm = input(" 실행하시겠습니까? [Enter=yes/0=no] >> ").strip()
+        if confirm == "0":
+            continue
         _run_llm_task(task.key, optimizer, extra)
         input("엔터를 눌러 계속...")
 
@@ -135,7 +195,8 @@ def run_llm_smoke_menu():
         clear_screen()
         print_header("LLM Smoke Tests")
         for idx, scenario in enumerate(LLM_SMOKE_SCENARIOS, start=1):
-            print(f" [{idx}] {scenario['label']}")
+            ready = "✅" if _llm_dataset_ready(scenario["task"]) else "❌"
+            print(f" [{idx}] {scenario['label']} | 데이터셋 {ready}")
         print(" [A] 전체 스모크 일괄 실행")
         print(" [0] 돌아가기")
         choice = input(" 선택 >> ").strip()
@@ -143,7 +204,8 @@ def run_llm_smoke_menu():
             return
         if choice.lower() == "a":
             for scenario in LLM_SMOKE_SCENARIOS:
-                print(f"[LLM-SMOKE-ALL] {scenario['label']}")
+                status = "READY" if _llm_dataset_ready(scenario["task"]) else "MISS"
+                print(f"[LLM-SMOKE-ALL] {scenario['label']} ({status})")
                 _run_llm_task(scenario["task"], scenario["optimizer"], scenario["extra"])
             input("엔터를 눌러 계속...")
             continue
