@@ -105,3 +105,41 @@ def build_optimizer(model, name: str, lr: float, weight_decay: float, options: A
         return SOAPOpt(param_groups, lr=lr, weight_decay=weight_decay, **extra_args)
 
     raise ValueError(f"Unknown optimizer: {name}")
+
+
+def build_optimizer_generic(model, name: str, lr: float, weight_decay: float, options: Any):
+    """
+    Generic builder that mirrors the task-local versions used by NLP/LLM scripts.
+    Exposed here so every benchmark can share the same implementations.
+    """
+    name = name.lower()
+    if name == "rico":
+        rico_args = dict(
+            bk_beta_target=_opt_attr(options, "rico_bk_beta", 0.9),
+            k_cap=_opt_attr(options, "rico_k_cap", 0.08),
+            g_rms_floor=_opt_attr(options, "rico_g_floor", 1e-3),
+            sync_every=_opt_attr(options, "rico_sync_every", 20),
+        )
+        return make_rico_optimizer(model, lr, weight_decay, rico_args)
+
+    param_groups = split_decay_params(model, weight_decay)
+    if name == "adamw":
+        return optim.AdamW(param_groups, lr=lr)
+    if name == "lion":
+        if LionOpt is None:
+            raise RuntimeError("Lion optimizer requested but `lion-pytorch` is not installed.")
+        beta1 = _opt_attr(options, "lion_beta1", 0.9)
+        beta2 = _opt_attr(options, "lion_beta2", 0.99)
+        return LionOpt(param_groups, lr=lr, betas=(beta1, beta2), weight_decay=weight_decay)
+    if name == "soap":
+        if SOAPOpt is None:
+            raise RuntimeError("SOAP optimizer requested but `pytorch-optimizer` with SOAP is not installed.")
+        extra_args = {}
+        soap_raw = _opt_attr(options, "soap_args", None)
+        if soap_raw:
+            try:
+                extra_args = json.loads(soap_raw)
+            except Exception as exc:
+                print(f"[warn] --soap_args JSON parse failed: {exc} → ignoring extra kwargs")
+        return SOAPOpt(param_groups, lr=lr, weight_decay=weight_decay, **extra_args)
+    raise ValueError(f"Unknown optimizer: {name}")

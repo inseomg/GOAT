@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse, time, json, math, random
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
+import os
+import sys
 import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -15,6 +17,60 @@ from transformers import (
     AutoModelForMultipleChoice, AutoModelForQuestionAnswering,
     DataCollatorWithPadding
 )
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+DATA_DIR = ROOT / "data"
+HF_CACHE = DATA_DIR / "hf-cache"
+os.environ.setdefault("HF_HOME", str(HF_CACHE))
+os.environ.setdefault("HF_DATASETS_CACHE", str(HF_CACHE))
+os.environ.pop("TRANSFORMERS_CACHE", None)
+
+from datetime import datetime
+from goat_bench.utils.helpers import exit_requested
+from goat_bench.utils.checkpointing import save_checkpoint
+
+_CKPT_ROOT = Path(__file__).resolve().parents[2] / "results" / "checkpoints"
+
+
+def _save_hvy_checkpoint(
+    tag: str,
+    dataset: str,
+    args,
+    model,
+    optimizer,
+    scheduler,
+    epoch: int,
+    best_metric: float,
+    extra: Optional[Dict[str, Any]] = None,
+):
+    _CKPT_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_ds = dataset.replace("/", "_")
+    path = _CKPT_ROOT / f"{tag}_{safe_ds}_epoch{epoch}_{stamp}.pt"
+    state: Dict[str, Any] = {
+        "tag": tag,
+        "dataset": dataset,
+        "epoch": epoch,
+        "best_metric": best_metric,
+        "args": vars(args),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+    }
+    if extra:
+        state.update(extra)
+    save_checkpoint(path, state)
+    return path
+
+
+def _attach_interrupt_meta(summary: Dict[str, Any], checkpoint_path: Optional[Path]):
+    summary["interrupted"] = checkpoint_path is not None
+    if checkpoint_path:
+        summary["checkpoint"] = str(checkpoint_path)
+    return summary
+
 
 # ----- optional metrics -----
 try:
@@ -116,6 +172,9 @@ class TrainerBase:
         self.wall0 = time.perf_counter()
 
     def _mark_seen_tokens(self, n:int): self.seen_tokens_epoch += int(n)
+    def _check_stop(self):
+        if exit_requested():
+            raise KeyboardInterrupt
     def _maybe_ttt(self, metric: float):
         if self.ttt_target is None or self.ttt_sec is not None: return
         ok = (metric >= self.ttt_target) if self.higher_is_better else (metric <= self.ttt_target)
@@ -163,6 +222,7 @@ class MultiRCRunner(TrainerBase):
             dt=time.perf_counter()-t0
             self.step_times.append(dt); self.losses_epoch.append(float(loss.detach().cpu()))
             self._mark_seen_tokens(batch["input_ids"].ne(self.tok.pad_token_id).sum().item())
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -182,6 +242,7 @@ class MultiRCRunner(TrainerBase):
             for qi,ai,yi,pi in zip(qid,aid,y,p):
                 preds.append({"idx": {"question": int(qi), "answer": int(ai)}, "label": int(pi)})
                 refs.append({"idx": {"question": int(qi), "answer": int(ai)}, "label": int(yi)})
+            self._check_stop()
 
         if self.metric:
             res = self.metric.compute(predictions=preds, references=refs)
@@ -288,6 +349,7 @@ class ReCORDRunner(TrainerBase):
             dt=time.perf_counter()-t0
             self.step_times.append(dt); self.losses_epoch.append(float(loss.detach().cpu()))
             self._mark_seen_tokens(attention_mask.sum().item())
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -311,6 +373,7 @@ class ReCORDRunner(TrainerBase):
                 out = self.model(input_ids=input_ids, attention_mask=attention_mask)
             pred = out.logits.argmax(-1).cpu()
             accs += (pred==labels).int().tolist()
+            self._check_stop()
         score = 100.0*sum(accs)/max(len(accs),1)
         self._maybe_ttt(score); self._update_best(score)
         return {"val_score": score}
@@ -401,6 +464,7 @@ class HotpotRunner(TrainerBase):
             dt=time.perf_counter()-t0
             self.step_times.append(dt); self.losses_epoch.append(float(loss.detach().cpu()))
             self._mark_seen_tokens(feat["attention_mask"].sum().item())
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -426,6 +490,7 @@ class HotpotRunner(TrainerBase):
                     prec = common/max(len(wa),1); rec = common/max(len(wb),1);
                     return 2*prec*rec/max(prec+rec,1e-12)
                 f1s.append(max([f1(pred,g) for g in golds]) if golds else 0.0); ems.append(em)
+            self._check_stop()
         em = 100.0*sum(ems)/max(len(ems),1); f1 = 100.0*sum(f1s)/max(len(f1s),1)
         score = 0.5*(em+f1)
         self._maybe_ttt(score); self._update_best(score)
@@ -537,11 +602,22 @@ def run_multirc(args):
     opt=build_optimizer(model,args.optimizer,lr,args.wd,args); sch=optim.lr_scheduler.CosineAnnealingLR(opt,T_max=args.epochs)
     runner=MultiRCRunner(model,tok,opt,sch,device,amp=args.amp,ttt_target=args.ttt_target,clip_grad_norm=args.clip_grad_norm)
     best=-1e9; wall0=time.perf_counter()
-    for ep in range(1,args.epochs+1):
-        runner.train_epoch(tr); val=runner.validate(va); sch.step(); best=max(best, val["val_score"])
-        peak=torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        print(f"[MultiRC] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f} | peak {human_mb(peak)}MB")
-    return {"task":"multirc","perf":best,"ttt_sec":runner.ttt_sec}
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1,args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr); val=runner.validate(va); last_val = val
+            sch.step(); best=max(best, val["val_score"])
+            peak=torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            print(f"[MultiRC] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f} | peak {human_mb(peak)}MB")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_hvy_checkpoint("nlp_multirc", "multirc", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[MultiRC] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
+    total_sec = time.perf_counter() - wall0
+    summary = {"task":"multirc","perf":best,"ttt_sec":runner.ttt_sec,"total_time_sec":total_sec}
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_record(args):
     device="cuda" if torch.cuda.is_available() else "cpu"
@@ -554,10 +630,20 @@ def run_record(args):
     opt=build_optimizer(model,args.optimizer,lr,args.wd,args); sch=optim.lr_scheduler.CosineAnnealingLR(opt,T_max=args.epochs)
     runner=ReCORDRunner(model,tok,opt,sch,device,amp=args.amp,ttt_target=args.ttt_target,clip_grad_norm=args.clip_grad_norm)
     best=-1e9
-    for ep in range(1,args.epochs+1):
-        runner.train_epoch(tr); val=runner.validate(va); sch.step(); best=max(best, val["val_score"])
-        print(f"[ReCoRD] ep {ep}/{args.epochs} | acc {val['val_score']:.2f} | best {best:.2f}")
-    return {"task":"record","perf":best,"ttt_sec":runner.ttt_sec}
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1,args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr); val=runner.validate(va); last_val = val
+            sch.step(); best=max(best, val["val_score"])
+            print(f"[ReCoRD] ep {ep}/{args.epochs} | acc {val['val_score']:.2f} | best {best:.2f}")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_hvy_checkpoint("nlp_record", "record", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[ReCoRD] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
+    summary = {"task":"record","perf":best,"ttt_sec":runner.ttt_sec}
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_hotpot(args):
     device="cuda" if torch.cuda.is_available() else "cpu"
@@ -569,10 +655,20 @@ def run_hotpot(args):
     opt=build_optimizer(model,args.optimizer,lr,args.wd,args); sch=optim.lr_scheduler.CosineAnnealingLR(opt,T_max=args.epochs)
     runner=HotpotRunner(model,tok,opt,sch,device,amp=args.amp,ttt_target=args.ttt_target,clip_grad_norm=args.clip_grad_norm)
     best=-1e9
-    for ep in range(1,args.epochs+1):
-        runner.train_epoch(tr); val=runner.validate(va); sch.step(); best=max(best, val["val_score"])
-        print(f"[HotpotQA] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f}")
-    return {"task":"hotpotqa","perf":best,"ttt_sec":runner.ttt_sec}
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1,args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr); val=runner.validate(va); last_val = val
+            sch.step(); best=max(best, val["val_score"])
+            print(f"[HotpotQA] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f}")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_hvy_checkpoint("nlp_hotpotqa", "hotpotqa", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[HotpotQA] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
+    summary = {"task":"hotpotqa","perf":best,"ttt_sec":runner.ttt_sec}
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 # ---- NQ-open / BBH plugs (stub) ----
 def run_nq_open(args):

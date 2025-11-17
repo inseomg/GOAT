@@ -3,58 +3,70 @@
     "cifar100": {
       "lr": 0.18,
       "weight_decay": 0.05,
+      "batch_size": 256,
       "preset": "cifar_resnet"
     },
     "cifar10": {
       "lr": 0.3,
       "weight_decay": 0.05,
+      "batch_size": 256,
       "preset": "balanced"
     },
     "tinyimagenet": {
       "lr": 0.2,
       "weight_decay": 0.05,
+      "batch_size": 256,
       "preset": "balanced"
     },
     "imagenet": {
       "lr": 0.12,
       "weight_decay": 0.02,
+      "batch_size": 256,
       "preset": "imagenet_resnet"
     },
     "coco2017": {
       "lr": 0.02,
       "weight_decay": 0.0001,
+      "batch_size": 32,
       "preset": "detection_default"
     },
     "ade20k": {
       "lr": 0.015,
       "weight_decay": 0.0001,
+      "batch_size": 32,
       "preset": "segmentation_default"
     }
   },
   "adamw": {
     "cifar100": {
       "lr": 0.12,
-      "weight_decay": 0.0005
+      "weight_decay": 0.0005,
+      "batch_size": 256
     },
     "cifar10": {
       "lr": 0.1,
-      "weight_decay": 0.0005
+      "weight_decay": 0.0005,
+      "batch_size": 256
     },
     "tinyimagenet": {
       "lr": 0.05,
-      "weight_decay": 0.0005
+      "weight_decay": 0.0005,
+      "batch_size": 256
     },
     "imagenet": {
       "lr": 0.003,
-      "weight_decay": 0.05
+      "weight_decay": 0.05,
+      "batch_size": 256
     },
     "coco2017": {
       "lr": 0.0002,
-      "weight_decay": 0.0001
+      "weight_decay": 0.0001,
+      "batch_size": 32
     },
     "ade20k": {
       "lr": 0.0003,
-      "weight_decay": 0.0001
+      "weight_decay": 0.0001,
+      "batch_size": 32
     }
   },
   "models": {

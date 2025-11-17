@@ -4,9 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from goat_bench.utils.helpers import clear_screen, print_header
+from goat_bench.utils.helpers import clear_screen, print_header, get_hw_profile, set_hw_profile, profile_name
 from goat_bench.tasks.nlp import run_nlp_menu, run_nlp_suite, run_nlp_smoke_menu
-from goat_bench.tasks.llm import run_llm_menu, run_llm_quick
+from goat_bench.tasks.llm import run_llm_menu, run_llm_quick, run_llm_smoke_menu
 from setup.prepare_data import has_dataset, dataset_root
 
 from .cv.config import CVTaskConfig
@@ -86,6 +86,7 @@ def _default_cv_config(task: str) -> CVTaskConfig:
             dataset=dataset,
             model="resnet50",
             batch_size=128,
+            batch_override=False,
             epochs=2,
             amp="fp16",
             subset_frac=1.0,
@@ -98,6 +99,7 @@ def _default_cv_config(task: str) -> CVTaskConfig:
             optimizer="adamw",
             dataset=dataset,
             batch_size=16,
+            batch_override=False,
             epochs=12,
             amp="fp16",
         )
@@ -108,6 +110,7 @@ def _default_cv_config(task: str) -> CVTaskConfig:
         optimizer="adamw",
         dataset=dataset,
         batch_size=16,
+        batch_override=False,
         epochs=40,
         amp="fp16",
     )
@@ -124,6 +127,7 @@ CV_SMOKE_SCENARIOS = [
             dataset="cifar100",
             model="resnet18",
             batch_size=64,
+            batch_override=True,
             subset_frac=0.1,
             epochs=1,
             amp="fp16",
@@ -131,7 +135,7 @@ CV_SMOKE_SCENARIOS = [
         ),
     },
     {
-        "label": "Classification - TinyImageNet (ResNet34, subset=5%, 1 epoch)",
+        "label": "Classification - TinyImageNet (ResNet34, subset=2%, 1 epoch)",
         "dataset": "tinyimagenet",
         "builder": lambda: CVTaskConfig(
             task="cls",
@@ -139,11 +143,12 @@ CV_SMOKE_SCENARIOS = [
             optimizer="adamw",
             dataset="tinyimagenet",
             model="resnet34",
-            batch_size=64,
-            subset_frac=0.05,
+            batch_size=48,
+            batch_override=True,
+            subset_frac=0.02,
             epochs=1,
             amp="fp16",
-            workers=2,
+            workers=4,
         ),
     },
     {
@@ -155,6 +160,7 @@ CV_SMOKE_SCENARIOS = [
             optimizer="adamw",
             dataset="coco2017",
             batch_size=4,
+            batch_override=True,
             subset_frac=0.02,
             epochs=1,
             amp="fp16",
@@ -170,6 +176,7 @@ CV_SMOKE_SCENARIOS = [
             optimizer="adamw",
             dataset="ade20k",
             batch_size=8,
+            batch_override=True,
             subset_frac=0.02,
             epochs=1,
             amp="fp16",
@@ -196,7 +203,9 @@ def _build_cv_config(task: str) -> CVTaskConfig:
             2,
             "Backbone",
         )
-        batch = _prompt_int("배치 사이즈", 128) or 128
+        batch_input = _prompt_int("배치 사이즈", 128)
+        batch = batch_input or 128
+        batch_override = batch_input is not None
         data_dir_default = _default_data_dir_for(dataset)
         data_dir = Path(_prompt("데이터 디렉터리", str(data_dir_default))).expanduser()
 
@@ -212,6 +221,7 @@ def _build_cv_config(task: str) -> CVTaskConfig:
             dataset=dataset,
             model=model,
             batch_size=batch,
+            batch_override=batch_override,
             subset_frac=subset,
             epochs=epochs,
             amp=amp,
@@ -220,7 +230,9 @@ def _build_cv_config(task: str) -> CVTaskConfig:
     data_dir_default = _default_data_dir_for(default_name)
     data_dir = Path(_prompt("데이터 디렉터리", str(data_dir_default))).expanduser()
     batch_default = 16
-    batch = _prompt_int("배치 사이즈", batch_default) or batch_default
+    batch_input = _prompt_int("배치 사이즈", batch_default)
+    batch = batch_input or batch_default
+    batch_override = batch_input is not None
     if _confirm("Optimizer/AMP/데이터 비율 등 고급 옵션을 조정하시겠습니까?", False):
         optimizer = _select_from(["adamw", "lion", "soap"], 0, "Optimizer 선택")
         amp = _select_from(["none", "fp16", "bf16"], 1, "AMP 모드")
@@ -232,6 +244,7 @@ def _build_cv_config(task: str) -> CVTaskConfig:
         optimizer=optimizer,
         dataset=default_name,
         batch_size=batch,
+        batch_override=batch_override,
         subset_frac=subset,
         epochs=epochs,
         amp=amp,
@@ -245,10 +258,25 @@ def _run_cv_smoke_menu():
         for idx, scenario in enumerate(CV_SMOKE_SCENARIOS, start=1):
             status = "✅" if has_dataset(scenario["dataset"], DEFAULT_DATA_DIR) else "❌"
             print(f" [{idx}] {scenario['label']} [{status}]")
+        print(" [A] 전체 스모크 일괄 실행")
         print(" [0] 돌아가기")
         choice = input(" 선택 >> ").strip()
         if choice == "0":
             return
+        if choice.lower() == "a":
+            for scenario in CV_SMOKE_SCENARIOS:
+                if not has_dataset(scenario["dataset"], DEFAULT_DATA_DIR):
+                    print(f"[SKIP] {scenario['label']} (데이터셋 미준비)")
+                    continue
+                cfg = scenario["builder"]()
+                print(f"[SMOKE-ALL] {scenario['label']}")
+                try:
+                    from .cv.runners import run_task
+                    run_task(cfg)
+                except Exception as exc:
+                    print(f"[ERROR] 스모크 테스트 실행 실패: {exc}")
+            input("엔터를 눌러 계속하세요...")
+            continue
         try:
             scenario = CV_SMOKE_SCENARIOS[int(choice) - 1]
         except Exception:
@@ -273,7 +301,8 @@ def _run_cv_smoke_menu():
 def run_benchmark_menu():
     while True:
         clear_screen()
-        print_header("벤치마크 실행")
+        print_header(f"벤치마크 실행 (Profile: {profile_name()})")
+        print(" [TIP] 학습 중 터미널에 'exit' 입력(또는 .goat_exit 파일 생성)하면 안전하게 중단되고 체크포인트가 저장됩니다.")
         print(" [1] CV - Classification (ResNet on CIFAR/TinyIN/ImageNet)")
         print(" [2] CV - Detection (FasterRCNN on COCO)")
         print(" [3] CV - Segmentation (DeepLabV3 on ADE20K)")
@@ -287,11 +316,19 @@ def run_benchmark_menu():
         print(" [11] LLM - L2 QUICK (1B SFT)")
         print(" [12] LLM - L3 QUICK (8B SFT)")
         print(" [13] LLM - 전체 작업 선택")
+        print(" [14] LLM - SMOKE TESTS")
+        print(" [P] 프로파일 설정 (auto/cpu/gpu/gpu_high)")
         print(" [0] 돌아가기")
         print("--------------------------------------------------")
         choice = input(" 선택 >> ").strip()
         if choice == "0":
             break
+        if choice.lower() == "p":
+            print("프로파일 선택: [1] AUTO (기본) [2] CPU [3] GPU [4] GPU-HIGH")
+            pick = input(" 번호 >> ").strip()
+            mapping = {"1": "auto", "2": "cpu", "3": "gpu", "4": "gpu_high"}
+            set_hw_profile(mapping.get(pick, "auto"))
+            continue
         if choice == "4":
             _run_cv_smoke_menu()
             continue
@@ -316,6 +353,9 @@ def run_benchmark_menu():
             continue
         if choice == "13":
             run_llm_menu()
+            continue
+        if choice == "14":
+            run_llm_smoke_menu()
             continue
         task_map = {"1": "cls", "2": "det", "3": "seg"}
         task = task_map.get(choice)

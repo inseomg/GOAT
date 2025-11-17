@@ -171,18 +171,17 @@ def _load_wmt_with_direction(direction: str):
     - 데이터셋은 사용 가능한 설정으로 로드하되, 샘플 내용을 스왑하지 않습니다.
       (전처리에서 칼럼 이름으로 바로 뽑아 쓰면 됨)
     """
-    from datasets import load_dataset
     src, tgt = direction.split("-")
 
     if direction in WMT14_VALID:
-        ds = load_dataset("wmt14", direction)
+        ds = _hf_load("wmt14", direction)
         used = ("wmt14", direction)
     elif f"{tgt}-{src}" in WMT14_VALID:
         # 반대 설정으로 로드하지만, src/tgt는 "요청 방향"을 그대로 유지
-        ds = load_dataset("wmt14", f"{tgt}-{src}")
+        ds = _hf_load("wmt14", f"{tgt}-{src}")
         used = ("wmt14", f"{tgt}-{src}")
     elif f"{tgt}-{src}" in WMT16_VALID:
-        ds = load_dataset("wmt16", f"{tgt}-{src}")
+        ds = _hf_load("wmt16", f"{tgt}-{src}")
         used = ("wmt16", f"{tgt}-{src}")
     else:
         raise ValueError(
@@ -193,14 +192,35 @@ def _load_wmt_with_direction(direction: str):
     return ds, src, tgt, used
 
 # 필수/옵션 라이브러리
-import argparse, time, json, math, os, random, statistics, re
+import argparse, time, json, math, os, random, statistics, re, shutil
 from pathlib import Path
+import sys
 from typing import Dict, Any, List, Tuple, Optional
+import sys
 
 import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import DefaultDataCollator, DataCollatorWithPadding, DataCollatorForSeq2Seq
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+DATA_DIR = ROOT / "data"
+HF_CACHE = DATA_DIR / "hf-cache"
+_os.environ.setdefault("HF_HOME", str(HF_CACHE))
+_os.environ.setdefault("HF_DATASETS_CACHE", str(HF_CACHE))
+_os.environ.pop("TRANSFORMERS_CACHE", None)
+HF_CACHE.mkdir(parents=True, exist_ok=True)
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+DATA_DIR = ROOT / "data"
+HF_CACHE = DATA_DIR / "hf-cache"
+os.environ.setdefault("HF_HOME", str(HF_CACHE))
+os.environ.setdefault("HF_DATASETS_CACHE", str(HF_CACHE))
+os.environ.pop("TRANSFORMERS_CACHE", None)
 # datasets
 try:
     from datasets import load_dataset
@@ -230,6 +250,38 @@ try:
 except Exception:
     pass
 
+
+def _purge_cache_entry(names: list[str]):
+    """Remove broken HF cache entries (legacy scripts) for the given dataset names."""
+    for nm in names:
+        ds_root = HF_CACHE / nm
+        if ds_root.exists():
+            shutil.rmtree(ds_root, ignore_errors=True)
+    hub = HF_CACHE / "hub"
+    if hub.exists():
+        for nm in names:
+            pat = nm.replace("/", "--")
+            for sub in hub.glob(f"datasets--*{pat}*"):
+                shutil.rmtree(sub, ignore_errors=True)
+
+
+def _hf_load(name: str, subset: str | None = None):
+    try:
+        return load_dataset(name, subset, cache_dir=str(HF_CACHE), trust_remote_code=True)
+    except Exception as exc:
+        # Legacy script error: purge cache and try once more
+        msg = str(exc)
+        if "xsum.py" in msg or "script" in msg:
+            patterns = [name, name.replace("/", "--")]
+            _purge_cache_entry(patterns)
+            return load_dataset(name, subset, cache_dir=str(HF_CACHE), trust_remote_code=True)
+        raise
+
+from datetime import datetime
+from goat_bench.optimizers.builder import build_optimizer, build_optimizer_generic
+from goat_bench.utils.helpers import exit_requested
+from goat_bench.utils.checkpointing import save_checkpoint
+
 # scipy (선택) — STS-B spearman 정확판정
 _scipy_spearmanr = None
 try:
@@ -257,6 +309,45 @@ except Exception:
     RICO, rico_layerwise_groups = None, None
 
 # ===== 공통 유틸 =====
+_CKPT_ROOT = Path(__file__).resolve().parents[2] / "results" / "checkpoints"
+
+
+def _save_nlp_checkpoint(
+    tag: str,
+    dataset: str,
+    args,
+    model,
+    optimizer,
+    scheduler,
+    epoch: int,
+    best_metric: float,
+    extra: Optional[Dict[str, Any]] = None,
+):
+    _CKPT_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_ds = dataset.replace("/", "_")
+    path = _CKPT_ROOT / f"{tag}_{safe_ds}_epoch{epoch}_{stamp}.pt"
+    state: Dict[str, Any] = {
+        "tag": tag,
+        "dataset": dataset,
+        "epoch": epoch,
+        "best_metric": best_metric,
+        "args": vars(args),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+    }
+    if extra:
+        state.update(extra)
+    save_checkpoint(path, state)
+    return path
+
+
+def _attach_interrupt_meta(summary: Dict[str, Any], checkpoint_path: Optional[Path]):
+    summary["interrupted"] = checkpoint_path is not None
+    if checkpoint_path:
+        summary["checkpoint"] = str(checkpoint_path)
+    return summary
 def set_seed(seed:int):
     random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
@@ -466,6 +557,9 @@ class TrainerBase:
         self.wall0 = time.perf_counter()
 
     def _mark_seen_tokens(self, n:int): self.seen_tokens_epoch += int(n)
+    def _check_stop(self):
+        if exit_requested():
+            raise KeyboardInterrupt
     def _maybe_ttt(self, metric: float):
         if self.ttt_target is None or self.ttt_sec is not None: return
         ok = (metric >= self.ttt_target) if self.higher_is_better else (metric <= self.ttt_target)
@@ -480,15 +574,15 @@ class TrainerBase:
 # ===== 분류(글루/슈글루) =====
 def load_cls_dataset(name:str):
     n = name.lower()
-    if n=="sst2":              return load_dataset("glue","sst2"), ("sentence",None), 2, "acc"
-    if n=="mrpc":              return load_dataset("glue","mrpc"), ("sentence1","sentence2"), 2, "f1_acc"
-    if n=="stsb":              return load_dataset("glue","stsb"), ("sentence1","sentence2"), 1, "pearson_spearman"
-    if n=="qqp":               return load_dataset("glue","qqp"), ("question1","question2"), 2, "f1_acc"
-    if n=="ag_news":           return load_dataset("ag_news"), ("text",None), 4, "acc"
-    if n=="boolq":             return load_dataset("super_glue","boolq"), ("question","passage"), 2, "acc"
-    if n=="rte":               return load_dataset("super_glue","rte"), ("premise","hypothesis"), 2, "acc"
-    if n=="cb":                return load_dataset("super_glue","cb"), ("premise","hypothesis"), 3, "macro_f1"
-    if n=="anli":              return load_dataset("anli"), ("premise","hypothesis"), 3, "acc"
+    if n=="sst2":              return _hf_load("glue","sst2"), ("sentence",None), 2, "acc"
+    if n=="mrpc":              return _hf_load("glue","mrpc"), ("sentence1","sentence2"), 2, "f1_acc"
+    if n=="stsb":              return _hf_load("glue","stsb"), ("sentence1","sentence2"), 1, "pearson_spearman"
+    if n=="qqp":               return _hf_load("glue","qqp"), ("question1","question2"), 2, "f1_acc"
+    if n=="ag_news":           return _hf_load("ag_news"), ("text",None), 4, "acc"
+    if n=="boolq":             return _hf_load("super_glue","boolq"), ("question","passage"), 2, "acc"
+    if n=="rte":               return _hf_load("super_glue","rte"), ("premise","hypothesis"), 2, "acc"
+    if n=="cb":                return _hf_load("super_glue","cb"), ("premise","hypothesis"), 3, "macro_f1"
+    if n=="anli":              return _hf_load("anli"), ("premise","hypothesis"), 3, "acc"
     # MCQ 계열은 별도 로더 사용
     raise ValueError(f"cls dataset 미지원: {name}")
 
@@ -562,6 +656,7 @@ class NLPClsRunner(TrainerBase):
             self._mark_seen_tokens(non_pad)
             pbar.set_postfix(loss=f"{sum(self.losses_epoch)/len(self.losses_epoch):.4f}",
                              p50=f"{percentile(self.step_times,50):.3f}s")
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -584,6 +679,7 @@ class NLPClsRunner(TrainerBase):
                 p = logits.argmax(-1)
                 pred.extend(p.detach().cpu().tolist())
                 gold.extend(batch["labels"].detach().cpu().tolist())
+            self._check_stop()
         if self.model.num_labels==1:
             m = self._metrics(gold, reg_pred); score = m.get("pearson", 0.0)
         else:
@@ -597,20 +693,21 @@ def build_mcq_loaders(name: str, model_name: str, max_length: int, batch_size: i
 
     # 📦 데이터셋 소스 고정 (ybisk 제거)
     if n == "winogrande":
-        ds = load_dataset("winogrande", "winogrande_xl")
+        ds = _hf_load("winogrande", "winogrande_xl")
     elif n in ("alpha_nli", "abductive_nli", "abductive-nli"):
+        _purge_cache_entry(["alpha_nli", "abductive_nli", "abductive-nli", "Rowan--abductive_nli", "XiangRong--abductive_nli"])
         try:
-            ds = load_dataset("abductive_nli")
+            ds = _hf_load("abductive_nli")
         except Exception:
-            ds = load_dataset("abductive-nli")
+            ds = _hf_load("abductive-nli")
     elif n == "piqa":
-        ds = load_dataset("lighteval/piqa")
+        ds = _hf_load("lighteval/piqa")
     elif n == "copa":
-        ds = load_dataset("super_glue", "copa")
+        ds = _hf_load("super_glue", "copa")
     elif n == "hellaswag":
-        ds = load_dataset("Rowan/hellaswag")
+        ds = _hf_load("Rowan/hellaswag")
     else:
-        ds = load_dataset(n)  # 기타 MCQ
+        ds = _hf_load(n)  # 기타 MCQ
 
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tok.pad_token is None:
@@ -695,6 +792,7 @@ class MCQRunner(TrainerBase):
             self._mark_seen_tokens(non_pad)
             pbar.set_postfix(loss=f"{sum(self.losses_epoch)/len(self.losses_epoch):.4f}",
                              p50=f"{percentile(self.step_times,50):.3f}s")
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -713,6 +811,7 @@ class MCQRunner(TrainerBase):
             preds = logits.argmax(-1)
             correct += (preds == batch["labels"]).sum().item()
             total   += batch["labels"].numel()
+            self._check_stop()
         acc = 100.0 * correct / max(total, 1)
         self._maybe_ttt(acc); self._update_best(acc)
         return {"val_score": acc, "acc": acc, "val_loss": vloss/max(total,1)}
@@ -791,6 +890,7 @@ class QARunner(TrainerBase):
             self._mark_seen_tokens(batch["input_ids"].ne(self.tok.pad_token_id).sum().item())
             pbar.set_postfix(loss=f"{sum(self.losses_epoch)/len(self.losses_epoch):.4f}",
                             p50=f"{percentile(self.step_times,50):.3f}s")
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -880,6 +980,7 @@ class QARunner(TrainerBase):
                             best_score = score
                             best_text  = span_text
                 ex_best[ex_id]["best_non_null"] = (best_score, best_text)
+            self._check_stop()
 
         # 최종 선택 (null vs non-null)
         preds = {}
@@ -924,7 +1025,7 @@ def build_squad2_loaders(model_name:str, batch:int, workers:int,
     tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token or tok.sep_token
-    ds = load_dataset("squad_v2")
+    ds = _hf_load("squad_v2")
 
     # ---- Train features (표준 처리) ----
     def prepare_train_features(examples):
@@ -1052,6 +1153,7 @@ class S2SRunner(TrainerBase):
             self._mark_seen_tokens(batch["input_ids"].ne(self.tok.pad_token_id).sum().item() + batch["labels"].ne(-100).sum().item())
             pbar.set_postfix(loss=f"{sum(self.losses_epoch)/len(self.losses_epoch):.4f}",
                              p50=f"{percentile(self.step_times,50):.3f}s")
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader, metric:str):
@@ -1065,6 +1167,7 @@ class S2SRunner(TrainerBase):
             y = batch["labels"].clone()
             y[y==-100] = self.tok.pad_token_id
             refs.extend(self.tok.batch_decode(y, skip_special_tokens=True))
+            self._check_stop()
         if metric=="bleu":
             if _sacrebleu:
                 bleu = _sacrebleu.corpus_bleu(preds, [refs]).score
@@ -1139,8 +1242,9 @@ def build_xsum_loaders(tok, batch_size: int, workers: int):
     1) Try official hub script (will likely fail on new datasets)
     2) Fallback to GEM parquet mirror (refs/convert/parquet)
     """
+    _purge_cache_entry(["xsum", "GEM--xsum", "EdinburghNLP--xsum"])
     try:
-        ds = load_dataset("EdinburghNLP/xsum")  # columns: document, summary
+        ds = _hf_load("EdinburghNLP/xsum")  # columns: document, summary
         src_key, tgt_key = "document", "summary"
     except Exception as e1:
         try:
@@ -1151,7 +1255,7 @@ def build_xsum_loaders(tok, batch_size: int, workers: int):
                 "validation": f"{base}/gem-validation.parquet",
                 "test": f"{base}/gem-test.parquet",
             }
-            ds = load_dataset("parquet", data_files=data_files)
+            ds = load_dataset("parquet", data_files=data_files, cache_dir=str(HF_CACHE))
             cols = set(ds["train"].column_names)
 
             if {"document", "summary"}.issubset(cols):
@@ -1276,6 +1380,7 @@ class LMRunner(TrainerBase):
             self._mark_seen_tokens(x.numel())
             pbar.set_postfix(loss=f"{sum(self.losses_epoch)/len(self.losses_epoch):.4f}",
                              p50=f"{percentile(self.step_times,50):.3f}s")
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -1291,6 +1396,7 @@ class LMRunner(TrainerBase):
             tokens = x.numel()
             tot_loss += float(loss.detach().cpu()) * tokens
             tot_tok  += tokens
+            self._check_stop()
         mean_loss = tot_loss/max(tot_tok,1)
         ppl = math.exp(mean_loss) if mean_loss < 20 else float("inf")
         self._maybe_ttt(ppl); self._update_best(ppl)
@@ -1317,6 +1423,7 @@ class MathRunner(TrainerBase):
             self.opt.step()
             dt=time.perf_counter()-t0
             self.step_times.append(dt); self.losses_epoch.append(float(loss.detach().cpu())); self._mark_seen_tokens(inp.numel())
+            self._check_stop()
 
     @torch.no_grad()
     def validate(self, loader):
@@ -1328,6 +1435,7 @@ class MathRunner(TrainerBase):
             out = self.tok.batch_decode(gen, skip_special_tokens=True)
             preds += [extract_last_number(o) or "" for o in out]
             golds += [extract_last_number(g) or "" for g in batch["answers"]]
+            self._check_stop()
         acc = 100.0*sum(int(a==b) for a,b in zip(golds,preds))/max(len(golds),1)
         self._maybe_ttt(acc); self._update_best(acc)
         return {"val_score": acc, "acc": acc}
@@ -1341,7 +1449,7 @@ def build_gsm8k_loaders(model_name: str, batch_size: int, workers: int, max_len:
     tok.padding_side = "left"  # ★ decoder-only는 left padding 권장
 
     # 2) 데이터 로드
-    ds = load_dataset("gsm8k", "main")
+    ds = _hf_load("gsm8k", "main")
 
     def _prepare(ex, max_len=max_len):
         q = ex["question"]
@@ -1452,19 +1560,28 @@ def run_glue_superglue(args, task:str):
     csv = Path(args.log_csv) if args.log_csv else None
     csv_keys = ["epoch","lr","train_loss","p50","p90","p99","throughput_tok_s","val_score","best_val","peak_mem_mb"]
     best=-1e9; wall0=time.perf_counter()
-    for ep in range(1, args.epochs+1):
-        runner.train_epoch(trldr)
-        tr_sum={"train_loss": sum(runner.losses_epoch)/max(len(runner.losses_epoch),1),
-                "p50": percentile(runner.step_times,50), "p90":percentile(runner.step_times,90),
-                "p99":percentile(runner.step_times,99), "throughput_tok_s": runner._throughput()}
-        val=runner.validate(valdr); sch.step(); best=max(best, val["val_score"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        row={"epoch":ep,"lr":sch.get_last_lr()[0],**tr_sum,**val,"best_val":best,"peak_mem_mb":human_mb(peak)}
-        write_csv(csv, row, header_keys=csv_keys)
-        print(f"[CLS:{task}] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f} | p99 {tr_sum['p99']:.3f}s")
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1, args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(trldr)
+            tr_sum={"train_loss": sum(runner.losses_epoch)/max(len(runner.losses_epoch),1),
+                    "p50": percentile(runner.step_times,50), "p90":percentile(runner.step_times,90),
+                    "p99":percentile(runner.step_times,99), "throughput_tok_s": runner._throughput()}
+            val=runner.validate(valdr); last_val = val
+            sch.step(); best=max(best, val["val_score"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            row={"epoch":ep,"lr":sch.get_last_lr()[0],**tr_sum,**val,"best_val":best,"peak_mem_mb":human_mb(peak)}
+            write_csv(csv, row, header_keys=csv_keys)
+            print(f"[CLS:{task}] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f} | p99 {tr_sum['p99']:.3f}s")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_nlp_checkpoint("nlp_cls", task, args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[CLS:{task}] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
     total_sec=time.perf_counter()-wall0
     loss_var=float(torch.tensor(runner.losses_epoch).var().item() if runner.losses_epoch else 0.0)
-    return {
+    summary = {
         "task":"cls", "dataset":task, "model":mdl_name, "optimizer":args.optimizer,
         "ttt_sec": runner.ttt_sec, "perf": best, "task_score": best,
         "speed": percentile(runner.step_times,50), "throughput": runner._throughput(),
@@ -1472,6 +1589,7 @@ def run_glue_superglue(args, task:str):
         "peak_mem_mb": human_mb(torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0),
         "total_time_sec": total_sec
     }
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_mcq(args, task: str):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1496,18 +1614,26 @@ def run_mcq(args, task: str):
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
 
     best=-1e9; wall0=time.perf_counter()
-    for ep in range(1, args.epochs+1):
-        runner.train_epoch(tr)
-        val = runner.validate(va)
-        _maybe_rescue_mcq(ep, runner, opt, args)
-        sch.step()
-        best = max(best, val["val_score"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        print(f"[MCQ:{task}] ep {ep}/{args.epochs} | acc {val['val_score']:.2f} | best {best:.2f} | p99 {percentile(runner.step_times,99):.3f}s | peak {human_mb(peak)} MB")
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1, args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr)
+            val = runner.validate(va); last_val = val
+            _maybe_rescue_mcq(ep, runner, opt, args)
+            sch.step()
+            best = max(best, val["val_score"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            print(f"[MCQ:{task}] ep {ep}/{args.epochs} | acc {val['val_score']:.2f} | best {best:.2f} | p99 {percentile(runner.step_times,99):.3f}s | peak {human_mb(peak)} MB")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_nlp_checkpoint("nlp_mcq", task, args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[MCQ:{task}] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
 
     total_sec = time.perf_counter() - wall0
     loss_var = float(torch.tensor(runner.losses_epoch).var().item() if runner.losses_epoch else 0.0)
-    return {
+    summary = {
         "task":"mcq", "dataset":task, "model":mdl_name, "optimizer":args.optimizer,
         "ttt_sec": runner.ttt_sec, "perf": best, "task_score": best,
         "speed": percentile(runner.step_times,50), "throughput": runner._throughput(),
@@ -1515,6 +1641,7 @@ def run_mcq(args, task: str):
         "peak_mem_mb": human_mb(torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0),
         "total_time_sec": total_sec
     }
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_qa_squad2(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1529,12 +1656,21 @@ def run_qa_squad2(args):
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
 
     best=-1e9; wall0=time.perf_counter()
-    for ep in range(1,args.epochs+1):
-        runner.train_epoch(tr); val=runner.validate(va); sch.step(); best=max(best, val["val_score"])
-        print(f"[QA:SQuADv2] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f}")
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1,args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr); val=runner.validate(va); last_val = val
+            sch.step(); best=max(best, val["val_score"])
+            print(f"[QA:SQuADv2] ep {ep}/{args.epochs} | score {val['val_score']:.2f} | best {best:.2f}")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_nlp_checkpoint("nlp_qa", "squad_v2", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[QA:SQuADv2] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
     total_sec=time.perf_counter()-wall0
     loss_var=float(torch.tensor(runner.losses_epoch).var().item() if runner.losses_epoch else 0.0)
-    return {
+    summary = {
         "task":"qa", "dataset":"squad_v2", "model":mdl_name, "optimizer":args.optimizer,
         "ttt_sec": runner.ttt_sec, "perf": best, "task_score": best,
         "speed": percentile(runner.step_times,50), "throughput": runner._throughput(),
@@ -1542,6 +1678,7 @@ def run_qa_squad2(args):
         "peak_mem_mb": human_mb(torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0),
         "total_time_sec": total_sec
     }
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_wmt14(args, direction="en-de"):
     device="cuda" if torch.cuda.is_available() else "cpu"
@@ -1557,12 +1694,22 @@ def run_wmt14(args, direction="en-de"):
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
 
     best=-1e9; wall0=time.perf_counter()
-    for ep in range(1,args.epochs+1):
-        runner.train_epoch(tr); val=runner.validate(va, metric="bleu"); sch.step(); best=max(best, val["val_score"])
-        print(f"[WMT14 {direction}] ep {ep}/{args.epochs} | BLEU {val['val_score']:.2f} | best {best:.2f}")
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1,args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr); val=runner.validate(va, metric="bleu"); last_val = val
+            sch.step(); best=max(best, val["val_score"])
+            print(f"[WMT14 {direction}] ep {ep}/{args.epochs} | BLEU {val['val_score']:.2f} | best {best:.2f}")
+    except KeyboardInterrupt:
+        dataset_name = f"wmt14-{direction}"
+        interrupted_ckpt = _save_nlp_checkpoint("nlp_mt", dataset_name, args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[WMT14 {direction}] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
     total_sec=time.perf_counter()-wall0
     loss_var=float(torch.tensor(runner.losses_epoch).var().item() if runner.losses_epoch else 0.0)
-    return {
+    summary = {
         "task":"mt", "dataset":f"wmt14-{direction}", "model":mdl_name, "optimizer":args.optimizer,
         "ttt_sec": runner.ttt_sec, "perf": best, "task_score": best,
         "speed": percentile(runner.step_times,50), "throughput": runner._throughput(),
@@ -1570,6 +1717,7 @@ def run_wmt14(args, direction="en-de"):
         "peak_mem_mb": human_mb(torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0),
         "total_time_sec": total_sec
     }
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_xsum(args):
     device="cuda" if torch.cuda.is_available() else "cpu"
@@ -1585,12 +1733,21 @@ def run_xsum(args):
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
 
     best=-1e9; wall0=time.perf_counter()
-    for ep in range(1,args.epochs+1):
-        runner.train_epoch(tr); val=runner.validate(va, metric="rouge"); sch.step(); best=max(best, val["val_score"])
-        print(f"[XSum] ep {ep}/{args.epochs} | ROUGE-L {val['val_score']:.2f} | best {best:.2f}")
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1,args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr); val=runner.validate(va, metric="rouge"); last_val = val
+            sch.step(); best=max(best, val["val_score"])
+            print(f"[XSum] ep {ep}/{args.epochs} | ROUGE-L {val['val_score']:.2f} | best {best:.2f}")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_nlp_checkpoint("nlp_summarization", "xsum", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[XSum] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
     total_sec=time.perf_counter()-wall0
     loss_var=float(torch.tensor(runner.losses_epoch).var().item() if runner.losses_epoch else 0.0)
-    return {
+    summary = {
         "task":"summ", "dataset":"xsum", "model":mdl_name, "optimizer":args.optimizer,
         "ttt_sec": runner.ttt_sec, "perf": best, "task_score": best,
         "speed": percentile(runner.step_times,50), "throughput": runner._throughput(),
@@ -1598,10 +1755,11 @@ def run_xsum(args):
         "peak_mem_mb": human_mb(torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0),
         "total_time_sec": total_sec
     }
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_lm(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ds = load_dataset("wikitext", "wikitext-2-raw-v1")
+    ds = _hf_load("wikitext", "wikitext-2-raw-v1")
     mdl_name = args.model_name or "distilgpt2"
     tok = AutoTokenizer.from_pretrained(mdl_name, use_fast=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
@@ -1626,17 +1784,26 @@ def run_lm(args):
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
 
     best=float("inf"); wall0=time.perf_counter()
-    for ep in range(1,args.epochs+1):
-        runner.train_epoch(trldr)
-        tr_sum={"train_loss": sum(runner.losses_epoch)/max(len(runner.losses_epoch),1),
-                "p50": percentile(runner.step_times,50), "p90":percentile(runner.step_times,90),
-                "p99":percentile(runner.step_times,99), "throughput_tok_s": runner._throughput()}
-        val = runner.validate(valdr); sch.step(); best=min(best, val["val_ppl"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
-        print(f"[LM][WT2] ep {ep}/{args.epochs} | ppl {val['val_ppl']:.2f} | best {best:.2f} | p99 {tr_sum['p99']:.3f}s (peak {human_mb(peak)}MB)")
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1,args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(trldr)
+            tr_sum={"train_loss": sum(runner.losses_epoch)/max(len(runner.losses_epoch),1),
+                    "p50": percentile(runner.step_times,50), "p90":percentile(runner.step_times,90),
+                    "p99":percentile(runner.step_times,99), "throughput_tok_s": runner._throughput()}
+            val = runner.validate(valdr); last_val = val
+            sch.step(); best=min(best, val["val_ppl"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0
+            print(f"[LM][WT2] ep {ep}/{args.epochs} | ppl {val['val_ppl']:.2f} | best {best:.2f} | p99 {tr_sum['p99']:.3f}s (peak {human_mb(peak)}MB)")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_nlp_checkpoint("nlp_lm", "wikitext-2-raw", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[LM][WT2] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
     total_sec=time.perf_counter()-wall0
     loss_var=float(torch.tensor(runner.losses_epoch).var().item() if runner.losses_epoch else 0.0)
-    return {
+    summary = {
         "task":"lm", "dataset":"wikitext-2-raw", "model":mdl_name, "optimizer":args.optimizer,
         "ttt_sec": runner.ttt_sec, "perf": best, "task_score": best,
         "speed": percentile(runner.step_times,50), "throughput": runner._throughput(),
@@ -1644,6 +1811,7 @@ def run_lm(args):
         "peak_mem_mb": human_mb(torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0),
         "total_time_sec": total_sec
     }
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 def run_gsm8k(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1668,13 +1836,22 @@ def run_gsm8k(args):
     if torch.cuda.is_available(): torch.cuda.reset_peak_memory_stats()
 
     best = -1e9; wall0 = time.perf_counter()
-    for ep in range(1, args.epochs+1):
-        runner.train_epoch(tr)
-        val = runner.validate(va); sch.step(); best = max(best, val["val_score"])
-        print(f"[GSM8K] ep {ep}/{args.epochs} | acc {val['val_score']:.2f} | best {best:.2f}")
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val = {}
+    try:
+        for ep in range(1, args.epochs+1):
+            current_epoch = ep
+            runner.train_epoch(tr)
+            val = runner.validate(va); last_val = val
+            sch.step(); best = max(best, val["val_score"])
+            print(f"[GSM8K] ep {ep}/{args.epochs} | acc {val['val_score']:.2f} | best {best:.2f}")
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_nlp_checkpoint("nlp_math", "gsm8k", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[GSM8K] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
     total_sec = time.perf_counter() - wall0
     loss_var = float(torch.tensor(runner.losses_epoch).var().item() if runner.losses_epoch else 0.0)
-    return {
+    summary = {
         "task":"math", "dataset":"gsm8k", "model":mdl_name, "optimizer":args.optimizer,
         "ttt_sec": runner.ttt_sec, "perf": best, "task_score": best,
         "speed": percentile(runner.step_times,50), "throughput": runner._throughput(),
@@ -1682,6 +1859,7 @@ def run_gsm8k(args):
         "peak_mem_mb": human_mb(torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0),
         "total_time_sec": total_sec
     }
+    return _attach_interrupt_meta(summary, interrupted_ckpt)
 
 # ===== HP 감도 스윕 (3x3) =====
 def hp_sweep(run_fn, args, base_lr:float, base_wd:float) -> float:

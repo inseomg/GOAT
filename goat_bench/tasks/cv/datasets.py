@@ -24,12 +24,19 @@ def ensure_tinyimagenet(root: Path):
 
     root = Path(root)
     ti_dir = root / "tiny-imagenet-200"
+    zip_path = root / "tiny-imagenet-200.zip"
+    marker = root / ".ready_tinyimagenet"
+    if marker.exists() and ti_dir.exists():
+        return
+
+    root.mkdir(parents=True, exist_ok=True)
     if not ti_dir.exists():
-        root.mkdir(parents=True, exist_ok=True)
-        url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
-        zip_path = root / "tiny-imagenet-200.zip"
-        print(f"[tinyimagenet] downloading → {zip_path}")
-        urlretrieve(url, zip_path)
+        if zip_path.exists():
+            print(f"[tinyimagenet] existing archive 발견 → {zip_path}")
+        else:
+            url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+            print(f"[tinyimagenet] downloading → {zip_path}")
+            urlretrieve(url, zip_path)
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(root)
         print("[tinyimagenet] extracted")
@@ -53,6 +60,8 @@ def ensure_tinyimagenet(root: Path):
                     shutil.move(str(src), str(dst))
         shutil.rmtree(img_dir, ignore_errors=True)
         print("[tinyimagenet] validation reorganized")
+
+    marker.write_text("ready", encoding="utf-8")
 
 
 def get_cls_datasets(dataset: str, root: Path):

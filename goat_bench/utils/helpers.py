@@ -44,6 +44,18 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def configure_hf_cache(data_root: Path) -> Path:
+    """
+    Ensure Hugging Face caches live under `data_root/hf-cache` and update env vars.
+    """
+    base = ensure_dir(data_root)
+    cache = ensure_dir(base / "hf-cache")
+    os.environ.setdefault("HF_HOME", str(cache))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(cache))
+    os.environ.pop("TRANSFORMERS_CACHE", None)
+    return cache
+
+
 _EXIT_TRIGGERED = False
 _EXIT_BUFFER = ""
 
@@ -153,4 +165,35 @@ class ConsoleSpinner:
         self._percent = 0
 
 
-__all__ = ["clear_screen", "print_header", "ensure_dir", "load_json", "exit_requested", "ConsoleSpinner"]
+__all__ = [
+    "clear_screen",
+    "print_header",
+    "ensure_dir",
+    "configure_hf_cache",
+    "load_json",
+    "exit_requested",
+    "ConsoleSpinner",
+    "get_hw_profile",
+    "set_hw_profile",
+    "profile_name",
+]
+
+_HW_PROFILE = "auto"  # auto | cpu | gpu | gpu_high
+
+
+def set_hw_profile(name: str):
+    """Set a global hardware/profile hint (auto/cpu/gpu/gpu_high)."""
+    global _HW_PROFILE
+    name = name.lower()
+    if name not in ("auto", "cpu", "gpu", "gpu_high"):
+        return
+    _HW_PROFILE = name
+
+
+def get_hw_profile() -> str:
+    return _HW_PROFILE
+
+
+def profile_name() -> str:
+    mapping = {"auto": "AUTO", "cpu": "CPU", "gpu": "GPU", "gpu_high": "GPU-HIGH"}
+    return mapping.get(_HW_PROFILE, "AUTO")

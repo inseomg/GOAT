@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from goat_bench.utils.helpers import clear_screen, print_header, ensure_dir
+from setup.prepare_data import has_dataset, dataset_root
 
 
 @dataclass
@@ -18,14 +20,14 @@ class NLPTaskInfo:
     script: str  # "part1" or "part2"
     description: str
     default_model: str | None = None
-    default_amp: str = "none"
+    default_amp: str = "bf16"
     heavy_warning: bool = False
 
 
 PART1_TASKS = [
-    NLPTaskInfo("suite:easy", "Suite: EASY (GLUE/MCQ + LM)", "part1", "sst2/mrpc/hellaswag/piqa/ag_news/lm 연속 실행", None, "fp16"),
-    NLPTaskInfo("suite:medium", "Suite: MEDIUM (GLUE/QA)", "part1", "boolq/rte/cb/copa/anli/squad_v2/xsum 연속 실행", None, "fp16"),
-    NLPTaskInfo("suite:hard", "Suite: HARD (WMT14 + GSM8K)", "part1", "wmt14_en_de, gsm8k 하드 태스크", None, "fp16", heavy_warning=True),
+    NLPTaskInfo("suite:easy", "Suite: EASY (GLUE/MCQ + LM)", "part1", "sst2/mrpc/hellaswag/piqa/ag_news/lm 연속 실행"),
+    NLPTaskInfo("suite:medium", "Suite: MEDIUM (GLUE/QA)", "part1", "boolq/rte/cb/copa/anli/squad_v2/xsum 연속 실행"),
+    NLPTaskInfo("suite:hard", "Suite: HARD (WMT14 + GSM8K)", "part1", "wmt14_en_de, gsm8k 하드 태스크", None, "bf16", heavy_warning=True),
     NLPTaskInfo("sst2", "GLUE - SST-2 Sentiment", "part1", "Binary sentiment classification", "roberta-base"),
     NLPTaskInfo("mrpc", "GLUE - MRPC Paraphrase", "part1", "Paraphrase detection", "roberta-base"),
     NLPTaskInfo("stsb", "GLUE - STS-B Regression", "part1", "Semantic textual similarity", "roberta-base"),
@@ -40,17 +42,17 @@ PART1_TASKS = [
     NLPTaskInfo("copa", "COPA MCQ", "part1", "Choice of plausible alternative", "roberta-base"),
     NLPTaskInfo("winogrande", "WinoGrande MCQ", "part1", "Pronoun resolution MCQ", "roberta-base"),
     NLPTaskInfo("alpha_nli", "AlphaNLI (abductive)", "part1", "Abductive reasoning MCQ", "roberta-base"),
-    NLPTaskInfo("squad_v2", "QA - SQuAD v2", "part1", "Question answering with no-answer option", "bert-base-uncased", "fp16"),
-    NLPTaskInfo("wmt14_en_de", "MT - WMT14 EN→DE", "part1", "Machine translation (English→German)", "Helsinki-NLP/opus-mt-en-de", "fp16", heavy_warning=True),
-    NLPTaskInfo("wmt14_de_en", "MT - WMT14 DE→EN", "part1", "Machine translation (German→English)", "Helsinki-NLP/opus-mt-de-en", "fp16", heavy_warning=True),
-    NLPTaskInfo("xsum", "Summarization - XSum", "part1", "Abstractive summarization", "facebook/bart-base", "fp16"),
-    NLPTaskInfo("lm", "Language Modeling - WikiText-2", "part1", "GPT-style causal LM fine-tune", "distilgpt2", "fp16"),
+    NLPTaskInfo("squad_v2", "QA - SQuAD v2", "part1", "Question answering with no-answer option", "bert-base-uncased"),
+    NLPTaskInfo("wmt14_en_de", "MT - WMT14 EN→DE", "part1", "Machine translation (English→German)", "Helsinki-NLP/opus-mt-en-de", "bf16", heavy_warning=True),
+    NLPTaskInfo("wmt14_de_en", "MT - WMT14 DE→EN", "part1", "Machine translation (German→English)", "Helsinki-NLP/opus-mt-de-en", "bf16", heavy_warning=True),
+    NLPTaskInfo("xsum", "Summarization - XSum", "part1", "Abstractive summarization", "facebook/bart-base"),
+    NLPTaskInfo("lm", "Language Modeling - WikiText-2", "part1", "GPT-style causal LM fine-tune", "distilgpt2"),
     NLPTaskInfo("gsm8k", "Math - GSM8K", "part1", "Math word problems (auto-regressive)", "gpt2", "none"),
 ]
 
 PART2_TASKS = [
-    NLPTaskInfo("multirc", "SuperGLUE - MultiRC", "part2", "Multi-sentence reading comprehension", "roberta-base", "bf16"),
-    NLPTaskInfo("record", "SuperGLUE - ReCoRD", "part2", "Entity cloze MCQ", "roberta-base", "bf16"),
+    NLPTaskInfo("multirc", "SuperGLUE - MultiRC", "part2", "Multi-sentence reading comprehension", "roberta-base"),
+    NLPTaskInfo("record", "SuperGLUE - ReCoRD", "part2", "Entity cloze MCQ", "roberta-base"),
     NLPTaskInfo("hotpotqa", "HotpotQA (distractor)", "part2", "Multi-hop QA with spans", "bert-base-uncased", "bf16", heavy_warning=True),
 ]
 
@@ -64,14 +66,86 @@ TASK_GROUPS: List[Tuple[str, List[str]]] = [
     ("Heavy Benchmarks", ["multirc", "record", "hotpotqa"]),
 ]
 
-NLP_SMOKE_SCENARIOS = [
-    ("sst2", "GLUE - SST2 (1 epoch quick check)", "part1", ["--epochs", "1", "--batch-size", "32"]),
-    ("squad_v2", "QA - SQuADv2 (1 epoch)", "part1", ["--epochs", "1", "--batch-size", "8", "--amp", "fp16"]),
-    ("wmt14_en_de", "MT - WMT14 EN→DE (1 epoch)", "part1", ["--epochs", "1", "--batch-size", "16", "--amp", "fp16"]),
-    ("gsm8k", "Math - GSM8K (1 epoch)", "part1", ["--epochs", "1", "--batch-size", "2"]),
+SUPPORTED_OPTIMIZERS = ["adamw", "lion", "soap"]
+NLP_SMOKE_DEFAULTS: Dict[str, List[str]] = {
+    "suite:easy": ["--epochs", "1", "--batch-size", "32"],
+    "suite:medium": ["--epochs", "1", "--batch-size", "32"],
+    "suite:hard": ["--epochs", "1", "--batch-size", "32"],
+    "sst2": ["--epochs", "1", "--batch-size", "32"],
+    "mrpc": ["--epochs", "1", "--batch-size", "32"],
+    "stsb": ["--epochs", "1", "--batch-size", "32"],
+    "qqp": ["--epochs", "1", "--batch-size", "32"],
+    "ag_news": ["--epochs", "1", "--batch-size", "64"],
+    "boolq": ["--epochs", "1", "--batch-size", "32"],
+    "rte": ["--epochs", "1", "--batch-size", "32"],
+    "cb": ["--epochs", "1", "--batch-size", "32"],
+    "anli": ["--epochs", "1", "--batch-size", "32"],
+    "hellaswag": ["--epochs", "1", "--batch-size", "32"],
+    "piqa": ["--epochs", "1", "--batch-size", "32"],
+    "copa": ["--epochs", "1", "--batch-size", "32"],
+    "winogrande": ["--epochs", "1", "--batch-size", "32"],
+    "alpha_nli": ["--epochs", "1", "--batch-size", "32"],
+    "squad_v2": ["--epochs", "1", "--batch-size", "32"],
+    "wmt14_en_de": ["--epochs", "1", "--batch-size", "32"],
+    "wmt14_de_en": ["--epochs", "1", "--batch-size", "32"],
+    "xsum": ["--epochs", "1", "--batch-size", "32"],
+    "lm": ["--epochs", "1", "--batch-size", "32", "--block-size", "512"],
+    "gsm8k": ["--epochs", "1", "--batch-size", "32"],
+    "multirc": ["--epochs", "1", "--batch-size", "32"],
+    "record": ["--epochs", "1", "--batch-size", "32"],
+    "hotpotqa": ["--epochs", "1", "--batch-size", "32"],
+}
+NLP_SMOKE_SCENARIOS: List[Dict[str, Any]] = [
+    {
+        "key": info.key,
+        "label": info.label,
+        "script": info.script,
+        "group": "Part1" if info.script == "part1" else "Part2",
+        "prefill": NLP_SMOKE_DEFAULTS.get(info.key, ["--epochs", "1", "--batch-size", "32"]),
+    }
+    for info in (PART1_TASKS + PART2_TASKS)
 ]
 
-SUPPORTED_OPTIMIZERS = ["adamw", "lion", "soap"]
+ROOT = Path(__file__).resolve().parents[2]
+HPS_NLP_PATH = ROOT / "configs" / "hps_nlp.json"
+HP_TASK_ALIASES = {
+    "lm": "lm_wikitext",
+}
+
+
+def _load_hp_presets() -> Dict[str, Dict[str, Dict[str, float]]]:
+    if not HPS_NLP_PATH.exists():
+        return {}
+    try:
+        data = json.loads(HPS_NLP_PATH.read_text(encoding="utf-8"))
+        return data
+    except Exception:
+        return {}
+
+
+HPS_CACHE = _load_hp_presets()
+
+
+def _hp_for_task(optimizer: str, task_key: str) -> Dict[str, float] | None:
+    opt_block = HPS_CACHE.get(optimizer.lower())
+    if not opt_block:
+        return None
+    alias = HP_TASK_ALIASES.get(task_key, task_key)
+    hp = opt_block.get(alias)
+    if hp:
+        return hp
+    return opt_block.get(task_key.replace("suite:", ""))
+
+
+def _maybe_apply_hp(args: List[str], optimizer: str, task_key: str):
+    hp = _hp_for_task(optimizer, task_key)
+    if not hp:
+        return
+    if "--lr" not in args and "lr" in hp:
+        args += ["--lr", str(hp["lr"])]
+    wd = hp.get("weight_decay") or hp.get("wd")
+    if wd is not None and "--wd" not in args and "--weight-decay" not in args:
+        args += ["--wd", str(wd)]
 
 
 def _prepare_env_and_scripts(data_root: Path) -> Tuple[Dict[str, str], Dict[str, Path]]:
@@ -79,10 +153,29 @@ def _prepare_env_and_scripts(data_root: Path) -> Tuple[Dict[str, str], Dict[str,
     env = os.environ.copy()
     env.setdefault("HF_HOME", str(hf_cache))
     env.setdefault("HF_DATASETS_CACHE", str(hf_cache))
-    env.setdefault("TRANSFORMERS_CACHE", str(hf_cache))
+    env.pop("TRANSFORMERS_CACHE", None)
+    root = Path(__file__).resolve().parents[3]
+    existing_pp = env.get("PYTHONPATH", "")
+    paths = [str(root)] + ([existing_pp] if existing_pp else [])
+    env["PYTHONPATH"] = os.pathsep.join([p for p in paths if p])
     scripts_dir = Path(__file__).resolve().parent
     scripts = {"part1": scripts_dir / "bench_part1.py", "part2": scripts_dir / "bench_part2.py"}
     return env, scripts
+
+
+def _dataset_ready(data_root: Path, task_key: str) -> bool:
+    # Suites: ready when all constituent tasks are ready
+    suites = {
+        "suite:easy": ["sst2", "mrpc", "hellaswag", "piqa", "ag_news", "lm"],
+        "suite:medium": ["boolq", "rte", "cb", "copa", "anli", "squad_v2", "xsum"],
+        "suite:hard": ["wmt14_en_de", "gsm8k"],
+    }
+    if task_key in suites:
+        return all(_dataset_ready(data_root, t) for t in suites[task_key])
+    # HF datasets live under data/hf-cache/<name>
+    ds_name = task_key
+    path = dataset_root(data_root, ds_name)
+    return path.exists() and any(path.iterdir())
 
 
 def run_nlp_menu(data_root: Path):
@@ -130,26 +223,63 @@ def run_nlp_suite(data_root: Path, suite_key: str):
 
 def run_nlp_smoke_menu(data_root: Path):
     env, scripts = _prepare_env_and_scripts(data_root)
+    filter_group = "all"
     while True:
         clear_screen()
-        print_header("NLP Smoke Tests")
-        for idx, (task_key, label, _, _) in enumerate(NLP_SMOKE_SCENARIOS, start=1):
-            info = TASK_INFO[task_key]
-            print(f" [{idx}] {label} ({info.label})")
+        header = f"NLP Smoke Tests (Filter: {filter_group.upper()})"
+        print_header(header)
+        print(" [F1] 전체 보기")
+        print(" [F2] Part 1 전용")
+        print(" [F3] Part 2 전용")
+        print(" [A] 전체 스모크 일괄 실행 (현재 필터 대상만)")
+        print("--------------------------------------------------")
+        scenarios = _filtered_smoke_scenarios(filter_group)
+        for idx, sc in enumerate(scenarios, start=1):
+            info = TASK_INFO[sc["key"]]
+            bsz = sc["prefill"][sc["prefill"].index("--batch-size") + 1] if "--batch-size" in sc["prefill"] else "32"
+            ready = "✅" if _dataset_ready(data_root, sc["key"]) else "❌"
+            print(f" [{idx}] {info.label:<35} | {sc['group']} | batch {bsz} | {ready}")
         print(" [0] 돌아가기")
-        choice = input(" 선택 >> ").strip()
+        choice = input(" 선택 >> ").strip().lower()
         if choice == "0":
             return
+        if choice in {"f1", "f", "all"}:
+            filter_group = "all"; continue
+        if choice in {"f2", "p1", "part1"}:
+            filter_group = "part1"; continue
+        if choice in {"f3", "p2", "part2"}:
+            filter_group = "part2"; continue
+        if choice == "a":
+            for sc in scenarios:
+                info = TASK_INFO[sc["key"]]
+                if not _dataset_ready(data_root, sc["key"]):
+                    print(f"[SKIP] {info.label} (데이터셋 미준비)")
+                    continue
+                print(f"[SMOKE-ALL] {info.label}")
+                _run_task_via_cli(info, scripts[info.script], env, prefill_args=sc["prefill"], allow_custom=False)
+            input("엔터를 눌러 계속...")
+            continue
         try:
-            scenario = NLP_SMOKE_SCENARIOS[int(choice) - 1]
+            scenario = scenarios[int(choice) - 1]
         except Exception:
             print("잘못된 선택입니다.")
             input("엔터를 눌러 계속...")
             continue
-        task_key, label, script_name, extra_args = scenario
-        info = TASK_INFO[task_key]
-        print(f"[SMOKE] {label}")
-        _run_task_via_cli(info, scripts[script_name], env, prefill_args=extra_args, allow_custom=False)
+        if not _dataset_ready(data_root, scenario["key"]):
+            print("[WARN] 데이터셋이 준비되지 않았습니다. 데이터셋 관리에서 먼저 다운로드하세요.")
+            input("엔터를 눌러 계속...")
+            continue
+        info = TASK_INFO[scenario["key"]]
+        print(f"[SMOKE] {info.label}")
+        _run_task_via_cli(info, scripts[info.script], env, prefill_args=scenario["prefill"], allow_custom=False)
+
+
+def _filtered_smoke_scenarios(group: str) -> List[Dict[str, Any]]:
+    if group == "part1":
+        return [sc for sc in NLP_SMOKE_SCENARIOS if sc["group"].lower() == "part1"]
+    if group == "part2":
+        return [sc for sc in NLP_SMOKE_SCENARIOS if sc["group"].lower() == "part2"]
+    return NLP_SMOKE_SCENARIOS
 
 
 def _run_task_via_cli(
@@ -235,6 +365,7 @@ def _run_task_via_cli(
     args.extend(extra_args)
     if prefill_args:
         args.extend(prefill_args)
+    _maybe_apply_hp(args, optimizer, info.key)
     _execute_cli(script_path, env, args)
 
 
@@ -242,6 +373,7 @@ def _execute_cli(script_path: Path, env: Dict[str, str], args: List[str]):
     print("\n실행 명령:")
     print(f"  python {script_path.name} {' '.join(args)}")
     print("--------------------------------------------------")
+    print(" [TIP] 학습 중 터미널에 'exit' 입력하면 안전하게 중단되며 체크포인트가 저장됩니다.")
     input("엔터를 누르면 실행합니다...")
 
     cmd = [sys.executable, str(script_path), *args]

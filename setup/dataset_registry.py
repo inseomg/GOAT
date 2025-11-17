@@ -61,7 +61,7 @@ DATASETS: Dict[str, DatasetInfo] = {
         domain="cv",
         approx_size_gb=3.5,
         requires_manual_download=True,
-        description="ADE20K segmentation dataset",
+        description="ADE20K segmentation dataset (MIT Scene Parsing Challenge, manual download required)",
         tags=["cv", "segmentation"],
     ),
     "imagenet1k": DatasetInfo(

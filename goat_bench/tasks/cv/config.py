@@ -24,6 +24,7 @@ class CVTaskConfig:
     weight_decay: float = 1e-2
     epochs: Optional[int] = None
     batch_size: int = 128
+    batch_override: bool = False
     workers: int = 8
     amp: Literal["none", "fp16", "bf16"] = "none"
     warmup_epochs: int = 5

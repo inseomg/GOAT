@@ -11,6 +11,8 @@ REQ_IMPORT_MAP: Dict[str, str] = {
     "lion-pytorch": "lion_pytorch",
     "pytorch-optimizer": "pytorch_optimizer",
     "sentencepiece": "sentencepiece",
+    "rouge-score": "rouge_score",
+    "absl-py": "absl",
 }
 
 

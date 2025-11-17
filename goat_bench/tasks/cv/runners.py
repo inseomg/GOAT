@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Subset
 
 from goat_bench.optimizers.builder import build_optimizer
 from goat_bench.utils.checkpointing import save_checkpoint
-from goat_bench.utils.helpers import ensure_dir
+from goat_bench.utils.helpers import ensure_dir, get_hw_profile
 
 from .config import CVTaskConfig
 from .datasets import ADE20K, CocoDet, collate_det, get_cls_datasets
@@ -27,6 +27,81 @@ from .utils import human_mb, percentile, set_seed, subset_dataset, write_csv_row
 _cpu_warned = False
 _CKPT_ROOT = Path(__file__).resolve().parents[2] / "results" / "checkpoints"
 _CLS_DATA_DIR_ALIASES = {"imagenet": "imagenet1k"}
+_HPS_CV_CACHE: Dict[str, Any] | None = None
+
+
+def _load_cv_hps() -> Dict[str, Any]:
+    global _HPS_CV_CACHE
+    if _HPS_CV_CACHE is None:
+        path = Path(__file__).resolve().parents[2] / "configs" / "hps_cv.json"
+        try:
+            _HPS_CV_CACHE = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            _HPS_CV_CACHE = {}
+    return _HPS_CV_CACHE
+
+
+def _cv_hp_for(dataset: str, optimizer: str) -> Dict[str, Any] | None:
+    cfg = _load_cv_hps()
+    opt_block = cfg.get(optimizer.lower())
+    if not opt_block:
+        return None
+    return opt_block.get(dataset.lower())
+
+
+def _apply_hp_overrides(cfg: CVTaskConfig):
+    hp = _cv_hp_for(cfg.dataset, cfg.optimizer)
+    if not hp:
+        return
+    batch_hint = hp.get("batch_size")
+    if batch_hint and not cfg.batch_override:
+        cfg.batch_size = int(batch_hint)
+    if hp.get("weight_decay") is not None:
+        cfg.weight_decay = float(hp["weight_decay"])
+    if cfg.lr is None and hp.get("lr") is not None:
+        cfg.lr = float(hp["lr"])
+
+
+def _apply_profile_overrides(cfg: CVTaskConfig):
+    profile = get_hw_profile()
+    if profile == "auto":
+        profile = "gpu" if torch.cuda.is_available() else "cpu"
+    if profile == "cpu":
+        if not cfg.batch_override:
+            cfg.batch_size = min(cfg.batch_size, 64 if cfg.task == "cls" else 8)
+        cfg.workers = min(cfg.workers, 2)
+        if hasattr(cfg, "model") and cfg.task == "cls" and cfg.dataset.lower() != "imagenet":
+            # keep modest backbone on CPU
+            pass
+    elif profile == "gpu":
+        if not cfg.batch_override:
+            if cfg.task == "cls":
+                cfg.batch_size = max(cfg.batch_size, 128)
+            else:
+                cfg.batch_size = max(cfg.batch_size, 16)
+        cfg.workers = max(cfg.workers, 4)
+        if hasattr(cfg, "model") and cfg.task == "cls":
+            if cfg.model.startswith("resnet"):
+                # keep user choice
+                pass
+    elif profile == "gpu_high":
+        if not cfg.batch_override:
+            if cfg.task == "cls":
+                cfg.batch_size = max(cfg.batch_size, 256)
+            elif cfg.task == "det":
+                cfg.batch_size = max(cfg.batch_size, 32)
+            else:
+                cfg.batch_size = max(cfg.batch_size, 32)
+        cfg.workers = max(cfg.workers, 8)
+        if hasattr(cfg, "model") and cfg.task == "cls" and cfg.model.startswith("resnet"):
+            # ensure at least resnet50
+            order = ["resnet18", "resnet34", "resnet50", "resnet101", "resnet152"]
+            try:
+                idx = order.index(cfg.model)
+                if idx < 2:
+                    cfg.model = "resnet50"
+            except ValueError:
+                pass
 
 
 def _warn_if_cpu_only():
@@ -145,6 +220,8 @@ def _resolve_cls_data_root(base: Path, dataset: str) -> Path:
 
 def run_classification(cfg: CVTaskConfig) -> Dict[str, Any]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _apply_profile_overrides(cfg)
+    _apply_hp_overrides(cfg)
     data_root = _resolve_cls_data_root(Path(cfg.data_dir), cfg.dataset)
     train_set, val_set, num_classes, input_size = get_cls_datasets(cfg.dataset, data_root)
     train_set = subset_dataset(train_set, cfg.subset_frac, cfg.seed)
@@ -283,6 +360,8 @@ def run_classification(cfg: CVTaskConfig) -> Dict[str, Any]:
 
 def run_detection(cfg: CVTaskConfig) -> Dict[str, Any]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _apply_profile_overrides(cfg)
+    _apply_hp_overrides(cfg)
     root = Path(cfg.data_dir)
     train_set_full = CocoDet(root / "train2017", root / "annotations" / "instances_train2017.json", train=True)
     val_set_full = CocoDet(root / "val2017", root / "annotations" / "instances_val2017.json", train=False)
@@ -414,6 +493,8 @@ def run_detection(cfg: CVTaskConfig) -> Dict[str, Any]:
 
 def run_segmentation(cfg: CVTaskConfig) -> Dict[str, Any]:
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    _apply_profile_overrides(cfg)
+    _apply_hp_overrides(cfg)
     root = Path(cfg.data_dir)
     train_set_full = ADE20K(root, "train", crop=(512, 512), train=True)
     val_set_full = ADE20K(root, "val", crop=(512, 512), train=False)

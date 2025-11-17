@@ -1,0 +1,14 @@
+{
+  "l1_pretrain": {
+    "adamw": { "lr": 6e-4, "weight_decay": 0.01 },
+    "rico":  { "lr": 3e-4, "weight_decay": 0.01 }
+  },
+  "l2_sft": {
+    "adamw": { "lr": 3e-5, "weight_decay": 0.01 },
+    "rico":  { "lr": 2e-5, "weight_decay": 0.01 }
+  },
+  "l3_llama": {
+    "adamw": { "lr": 2e-5, "weight_decay": 0.01 },
+    "rico":  { "lr": 1.5e-5, "weight_decay": 0.01 }
+  }
+}

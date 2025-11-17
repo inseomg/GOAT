@@ -15,8 +15,15 @@ import math
 import os
 import random
 import time
+from datetime import datetime
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+os.environ.pop("TRANSFORMERS_CACHE", None)
 
 import torch
 import torch.nn as nn  # noqa: F401  # kept for completeness / potential extensions
@@ -65,6 +72,67 @@ except Exception:
     if SOAPOpt is not None:
         avail.append("soap")
     print(f"[warn] rico.py 미발견 → --optimizer {', '.join(avail)} 만 사용 가능")
+
+from goat_bench.utils.helpers import exit_requested
+from goat_bench.utils.checkpointing import save_checkpoint
+
+_CKPT_ROOT = Path(__file__).resolve().parents[2] / "results" / "checkpoints"
+
+
+def _save_llm_checkpoint(
+    tag: str,
+    task: str,
+    args,
+    model,
+    optimizer,
+    scheduler,
+    epoch: int,
+    best_metric: float,
+    extra: Optional[Dict[str, Any]] = None,
+):
+    _CKPT_ROOT.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_task = task.replace("/", "_")
+    path = _CKPT_ROOT / f"{tag}_{safe_task}_epoch{epoch}_{stamp}.pt"
+    state: Dict[str, Any] = {
+        "tag": tag,
+        "task": task,
+        "epoch": epoch,
+        "best_metric": best_metric,
+        "args": vars(args),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+    }
+    if extra:
+        state.update(extra)
+    save_checkpoint(path, state)
+    return path
+
+
+def _attach_interrupt_meta(summary: Dict[str, Any], checkpoint_path: Optional[Path]):
+    summary["interrupted"] = checkpoint_path is not None
+    if checkpoint_path:
+        summary["checkpoint"] = str(checkpoint_path)
+    return summary
+
+
+def _default_worker_count() -> int:
+    try:
+        return 4 if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
+def _dataloader_options(workers: int, device: str) -> Dict[str, Any]:
+    worker_count = max(int(workers), 0)
+    opts: Dict[str, Any] = {"num_workers": worker_count}
+    use_cuda = device.startswith("cuda") and torch.cuda.is_available()
+    if use_cuda:
+        opts["pin_memory"] = True
+    if worker_count > 0:
+        opts["persistent_workers"] = True
+    return opts
 
 
 def set_seed(seed: int):
@@ -133,6 +201,10 @@ class LMTrainer:
         self.ttt_sec: Optional[float] = None
         self._wall0 = time.perf_counter()
 
+    def _check_stop(self):
+        if exit_requested():
+            raise KeyboardInterrupt
+
     def _move_batch_to_device(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if self.device.startswith("cuda"):
             return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
@@ -188,6 +260,7 @@ class LMTrainer:
             tk = self._token_count(batch)
             self.tokens_epoch += tk
             self.global_tokens += tk
+            self._check_stop()
 
         if torch.cuda.is_available() and self.device.startswith("cuda"):
             self.peak_mem_bytes = max(self.peak_mem_bytes, torch.cuda.max_memory_allocated())
@@ -208,6 +281,7 @@ class LMTrainer:
             btk = self._token_count(batch)
             total_loss += float(loss.detach().cpu()) * max(btk, 1)
             total_tok += max(btk, 1)
+            self._check_stop()
         avg_loss = total_loss / max(total_tok, 1)
         ppl = float(math.exp(min(avg_loss, 20.0)))
         self.best_val_metric = min(self.best_val_metric, avg_loss)
@@ -364,8 +438,18 @@ def run_l1(args):
 
     model.to(device)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        **_dataloader_options(args.workers, device),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        **_dataloader_options(args.workers, device),
+    )
 
     base_lr_rico = 3e-4
     base_lr_adamw = 6e-4
@@ -386,29 +470,38 @@ def run_l1(args):
     best = float("inf")
     wall0 = time.perf_counter()
 
-    for ep in range(1, args.epochs + 1):
-        if torch.cuda.is_available() and device.startswith("cuda"):
-            torch.cuda.reset_peak_memory_stats()
-        trainer.train_one_epoch(train_loader, ep, args.epochs)
-        train_summary = trainer.summarize_train_epoch()
-        val_summary = trainer.evaluate_one_epoch(val_loader)
-        best = min(best, val_summary["val_loss"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() and device.startswith("cuda") else 0
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val: Dict[str, Any] = {}
+    try:
+        for ep in range(1, args.epochs + 1):
+            current_epoch = ep
+            if torch.cuda.is_available() and device.startswith("cuda"):
+                torch.cuda.reset_peak_memory_stats()
+            trainer.train_one_epoch(train_loader, ep, args.epochs)
+            train_summary = trainer.summarize_train_epoch()
+            val_summary = trainer.evaluate_one_epoch(val_loader)
+            last_val = val_summary
+            best = min(best, val_summary["val_loss"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() and device.startswith("cuda") else 0
 
-        row = {
-            "epoch": ep,
-            "lr": opt.param_groups[0]["lr"],
-            **train_summary,
-            **val_summary,
-            "best_val_loss": best,
-            "peak_mem_mb": human_mb(peak),
-        }
-        write_csv_row(csv_path, row, header_first=(ep == 1))
-        print(
-            f"[L1][Epoch {ep}/{args.epochs}] loss {val_summary['val_loss']:.4f} | ppl {val_summary['val_ppl']:.2f} | "
-            f"best_loss {best:.4f} | p99 {train_summary['step_p99_sec']:.3f}s | "
-            f"thru {train_summary['throughput_tok_per_sec']:.1f} tok/s | LR {row['lr']:.6e}"
-        )
+            row = {
+                "epoch": ep,
+                "lr": opt.param_groups[0]["lr"],
+                **train_summary,
+                **val_summary,
+                "best_val_loss": best,
+                "peak_mem_mb": human_mb(peak),
+            }
+            write_csv_row(csv_path, row, header_first=(ep == 1))
+            print(
+                f"[L1][Epoch {ep}/{args.epochs}] loss {val_summary['val_loss']:.4f} | ppl {val_summary['val_ppl']:.2f} | "
+                f"best_loss {best:.4f} | p99 {train_summary['step_p99_sec']:.3f}s | "
+                f"thru {train_summary['throughput_tok_per_sec']:.1f} tok/s | LR {row['lr']:.6e}"
+            )
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_llm_checkpoint("llm_l1", "l1_pretrain", args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[L1] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
 
     total_sec = time.perf_counter() - wall0
     peak_all = trainer.peak_mem_bytes
@@ -428,11 +521,13 @@ def run_l1(args):
         "peak_mem_mb": human_mb(peak_all),
         "total_time_sec": total_sec,
     }
+    summary = _attach_interrupt_meta(summary, interrupted_ckpt)
     if args.log_json:
         Path(args.log_json).parent.mkdir(parents=True, exist_ok=True)
         with open(args.log_json, "w") as f:
             json.dump(summary, f, indent=2)
     print("[L1][SUMMARY]", json.dumps(summary, indent=2))
+    return summary
 
 
 def run_sft(args, track: str):
@@ -461,8 +556,18 @@ def run_sft(args, track: str):
         model.to(device)
         device_used = device
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        **_dataloader_options(args.workers, device_used),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        **_dataloader_options(args.workers, device_used),
+    )
 
     base_lr_rico = 2e-5
     base_lr_adamw = 3e-5
@@ -483,29 +588,38 @@ def run_sft(args, track: str):
     best = float("inf")
     wall0 = time.perf_counter()
 
-    for ep in range(1, args.epochs + 1):
-        if torch.cuda.is_available() and device_used.startswith("cuda"):
-            torch.cuda.reset_peak_memory_stats()
-        trainer.train_one_epoch(train_loader, ep, args.epochs)
-        train_summary = trainer.summarize_train_epoch()
-        val_summary = trainer.evaluate_one_epoch(val_loader)
-        best = min(best, val_summary["val_loss"])
-        peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() and device_used.startswith("cuda") else 0
+    interrupted_ckpt = None
+    current_epoch = 0
+    last_val: Dict[str, Any] = {}
+    try:
+        for ep in range(1, args.epochs + 1):
+            current_epoch = ep
+            if torch.cuda.is_available() and device_used.startswith("cuda"):
+                torch.cuda.reset_peak_memory_stats()
+            trainer.train_one_epoch(train_loader, ep, args.epochs)
+            train_summary = trainer.summarize_train_epoch()
+            val_summary = trainer.evaluate_one_epoch(val_loader)
+            last_val = val_summary
+            best = min(best, val_summary["val_loss"])
+            peak = torch.cuda.max_memory_allocated() if torch.cuda.is_available() and device_used.startswith("cuda") else 0
 
-        row = {
-            "epoch": ep,
-            "lr": opt.param_groups[0]["lr"],
-            **train_summary,
-            **val_summary,
-            "best_val_loss": best,
-            "peak_mem_mb": human_mb(peak),
-        }
-        write_csv_row(csv_path, row, header_first=(ep == 1))
-        print(
-            f"[{track}][Epoch {ep}/{args.epochs}] loss {val_summary['val_loss']:.4f} | ppl {val_summary['val_ppl']:.2f} | "
-            f"best_loss {best:.4f} | p99 {train_summary['step_p99_sec']:.3f}s | "
-            f"thru {train_summary['throughput_tok_per_sec']:.1f} tok/s | LR {row['lr']:.6e}"
-        )
+            row = {
+                "epoch": ep,
+                "lr": opt.param_groups[0]["lr"],
+                **train_summary,
+                **val_summary,
+                "best_val_loss": best,
+                "peak_mem_mb": human_mb(peak),
+            }
+            write_csv_row(csv_path, row, header_first=(ep == 1))
+            print(
+                f"[{track}][Epoch {ep}/{args.epochs}] loss {val_summary['val_loss']:.4f} | ppl {val_summary['val_ppl']:.2f} | "
+                f"best_loss {best:.4f} | p99 {train_summary['step_p99_sec']:.3f}s | "
+                f"thru {train_summary['throughput_tok_per_sec']:.1f} tok/s | LR {row['lr']:.6e}"
+            )
+    except KeyboardInterrupt:
+        interrupted_ckpt = _save_llm_checkpoint(f"llm_{track.lower()}", track, args, model, opt, sch, current_epoch, best, {"val_summary": last_val})
+        print(f"[{track}] 'exit' 신호 감지 → 체크포인트 저장: {interrupted_ckpt}")
 
     total_sec = time.perf_counter() - wall0
     peak_all = trainer.peak_mem_bytes
@@ -525,6 +639,7 @@ def run_sft(args, track: str):
         "peak_mem_mb": human_mb(peak_all),
         "total_time_sec": total_sec,
     }
+    summary = _attach_interrupt_meta(summary, interrupted_ckpt)
     if args.log_json:
         Path(args.log_json).parent.mkdir(parents=True, exist_ok=True)
         with open(args.log_json, "w") as f:
@@ -546,6 +661,12 @@ def build_arg_parser():
     ap.add_argument("--wd", type=float, default=0.01)
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=_default_worker_count(),
+        help="DataLoader workers (defaults to 4 when CUDA is available).",
+    )
     ap.add_argument("--max-seq-len", type=int, default=512)
     ap.add_argument("--amp", type=str, default="bf16", choices=["none", "fp16", "bf16"])
     ap.add_argument("--warmup-epochs", type=int, default=1)
